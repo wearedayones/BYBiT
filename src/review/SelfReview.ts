@@ -6,7 +6,7 @@ const log = childLogger({ module: 'self-review' });
 const WEIGHT_ALPHA = 0.2;
 const MIN_WEIGHT = 0.2;
 const MAX_WEIGHT = 2.5;
-const MIN_TRADES_FOR_REVIEW = 10;
+const MIN_TRADES_FOR_REVIEW = 5;
 const DRAWDOWN_DISABLE_THRESHOLD = -0.05;
 
 export class SelfReview {
@@ -33,7 +33,7 @@ export class SelfReview {
           AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END) as win_rate
         FROM trades
         WHERE closed_at > now() - INTERVAL '7 days'
-          AND strategy IS NOT NULL AND is_paper = false
+          AND strategy IS NOT NULL AND strategy != 'unknown'
         GROUP BY strategy
       `;
 
@@ -104,7 +104,7 @@ export class SelfReview {
         JOIN trades t ON t.decision_id = d.id
         WHERE d.ts > now() - INTERVAL '30 days'
           AND d.strategy IS NOT NULL AND d.regime IS NOT NULL
-          AND t.closed_at IS NOT NULL AND t.is_paper = false
+          AND t.closed_at IS NOT NULL
         GROUP BY d.strategy, d.regime, d.action
         HAVING COUNT(*) >= 5
       `;

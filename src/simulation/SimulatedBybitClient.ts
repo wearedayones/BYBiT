@@ -8,6 +8,7 @@ import type {
   PlaceOrderRequest, OrderResult, ClosedPnlItem, InstrumentInfo, FundingRateItem,
 } from '../exchange/types';
 import { childLogger } from '../core/logger';
+import { getDb } from '../persistence/db';
 
 const log = childLogger({ module: 'sim-client' });
 
@@ -16,6 +17,8 @@ interface SimPosition {
   side: 'Buy' | 'Sell';
   size: number;
   avgEntry: number;
+  openedAt: Date;
+  strategy: string;
   stopLoss?: number;
   takeProfit?: number;
 }
@@ -167,15 +170,19 @@ export class SimulatedBybitClient {
     const qty = parseFloat(req.qty);
     const orderId = `sim-${this.orderCounter++}`;
     const orderLinkId = req.orderLinkId ?? orderId;
+    // Extract strategy from order_link_id format: sim-{strategy}-{symbol}-{ts}
+    const strategy = req.orderLinkId?.split('-')[1] ?? 'unknown';
 
-    // Check for existing position to close
+    // Check for existing position to close (reduceOnly)
     const existing = this.account.positions.get(`${req.symbol}-${req.side === 'Buy' ? 'Sell' : 'Buy'}`);
     if (req.reduceOnly && existing) {
       const pnl = (req.side === 'Sell' ? 1 : -1) * qty * (price - existing.avgEntry);
       this.account.balance += pnl;
-      this.account.closedTrades.push({ symbol: req.symbol, pnl, closedAt: new Date() });
+      const closedAt = new Date();
+      this.account.closedTrades.push({ symbol: req.symbol, pnl, closedAt });
       this.account.positions.delete(`${req.symbol}-${existing.side}`);
       log.info({ symbol: req.symbol, side: req.side, qty, pnl: pnl.toFixed(2) }, '[SIM] Position closed');
+      this.persistTrade(req.symbol, existing.side, existing.avgEntry, price, qty, pnl, existing.strategy, existing.openedAt, closedAt).catch(() => {});
       return { orderId, orderLinkId };
     }
 
@@ -192,6 +199,7 @@ export class SimulatedBybitClient {
     } else {
       this.account.positions.set(posKey, {
         symbol: req.symbol, side: req.side, size: qty, avgEntry: fillPrice,
+        openedAt: new Date(), strategy,
         stopLoss: req.stopLoss ? parseFloat(req.stopLoss) : undefined,
         takeProfit: req.takeProfit ? parseFloat(req.takeProfit) : undefined,
       });
@@ -202,6 +210,22 @@ export class SimulatedBybitClient {
       sl: req.stopLoss, tp: req.takeProfit,
     }, '[SIM] Order filled');
     return { orderId, orderLinkId };
+  }
+
+  private async persistTrade(
+    symbol: string, side: string, entryPrice: number, exitPrice: number,
+    qty: number, pnl: number, strategy: string, openedAt: Date, closedAt: Date,
+  ): Promise<void> {
+    try {
+      const sql = getDb();
+      await sql`
+        INSERT INTO trades (strategy, symbol, category, side, entry_price, exit_price, qty, fee, realized_pnl, opened_at, closed_at, is_paper)
+        VALUES (${strategy}, ${symbol}, 'linear', ${side}, ${entryPrice}, ${exitPrice}, ${qty}, 0, ${pnl}, ${openedAt.toISOString()}, ${closedAt.toISOString()}, true)
+      `;
+      log.info({ symbol, side, pnl: pnl.toFixed(2), strategy }, '[SIM] Trade persisted to DB');
+    } catch (e) {
+      log.error({ e, symbol }, '[SIM] Failed to persist trade');
+    }
   }
 
   async cancelOrder(): Promise<void> {}
@@ -276,9 +300,11 @@ export class SimulatedBybitClient {
         const multiplier = pos.side === 'Buy' ? 1 : -1;
         const pnl = multiplier * pos.size * (price - pos.avgEntry);
         this.account.balance += pnl;
-        this.account.closedTrades.push({ symbol: pos.symbol, pnl, closedAt: new Date() });
+        const closedAt = new Date();
+        this.account.closedTrades.push({ symbol: pos.symbol, pnl, closedAt });
         this.account.positions.delete(key);
         log.info({ symbol: pos.symbol, hitType, pnl: pnl.toFixed(2), price: price.toFixed(2) }, `[SIM] ${hitType} hit`);
+        this.persistTrade(pos.symbol, pos.side, pos.avgEntry, price, pos.size, pnl, pos.strategy, pos.openedAt, closedAt).catch(() => {});
       }
     }
   }
