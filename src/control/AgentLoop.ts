@@ -13,6 +13,7 @@ import { KillSwitch } from './KillSwitch';
 import { PromotionManager } from './PromotionManager';
 import { KillSwitchError } from '../core/errors';
 import { CYCLE_INTERVAL_MS, REPO_POLL_INTERVAL_MS } from '../config/constants';
+import { rateLimiter } from '../exchange/rateLimiter';
 import { buildAndSendReport } from '../reports/ReportBuilder';
 import { checkAndUpdate } from '../updater/RepoUpdater';
 import type { WeightedSignal } from '../strategy/DecisionEngine';
@@ -215,11 +216,28 @@ export class AgentLoop {
 
   private adaptiveInterval(): number {
     const state = this.portfolio.getState();
-    if (!state) return CYCLE_INTERVAL_MS;
-    const drawdown = state.peakEquity > 0 ? (state.peakEquity - state.equity) / state.peakEquity : 0;
-    // Cycle faster in high drawdown (more responsive)
+    const base = CYCLE_INTERVAL_MS;
+
+    // High drawdown → cycle faster for faster de-risk response
+    const drawdown = state?.peakEquity > 0
+      ? (state.peakEquity - state.equity) / state.peakEquity : 0;
     if (drawdown > 0.08) return 30_000;
-    return CYCLE_INTERVAL_MS;
+
+    // Rate-limit pressure → back off to protect the quota window
+    const worst = rateLimiter.getWorstBucket();
+    if (worst && worst.limit > 0) {
+      const usage = (worst.limit - worst.remaining) / worst.limit;
+      if (usage > 0.90) {
+        // Slow to 3× to shed load while window recovers
+        log.warn({ usage: Math.round(usage * 100), endpoint: worst.endpoint }, 'API quota pressure — tripling cycle interval');
+        return base * 3;
+      }
+      if (usage > 0.75) {
+        return base * 2;
+      }
+    }
+
+    return base;
   }
 
   stop(): void { this.running = false; }

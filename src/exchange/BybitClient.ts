@@ -221,6 +221,7 @@ export class BybitClient {
         method: 'GET',
         headers: { 'User-Agent': USER_AGENT },
       });
+      rateLimiter.updateFromHeaders(res.headers as Record<string, string | string[]>, path.split('?')[0]);
       const body = await res.body.json() as BybitResponse<T>;
       if (body.retCode !== 0) {
         throw new BybitApiError(body.retCode, body.retMsg, path);
@@ -236,10 +237,11 @@ export class BybitClient {
       const basePath = qsStart >= 0 ? pathWithQs.slice(0, qsStart) : pathWithQs;
       const qs = qsStart >= 0 ? pathWithQs.slice(qsStart + 1) : '';
       const paramStr = buildGetParamStr(ts, this.apiKey, qs);
-      const headers = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
+      const reqHeaders = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
       const url = `${this.baseUrl}${pathWithQs}`;
       log.debug({ url }, 'GET (auth)');
-      const res = await request(url, { method: 'GET', headers });
+      const res = await request(url, { method: 'GET', headers: reqHeaders });
+      rateLimiter.updateFromHeaders(res.headers as Record<string, string | string[]>, basePath);
       const body = await res.body.json() as BybitResponse<T>;
       if (body.retCode !== 0) {
         const err = new BybitApiError(body.retCode, body.retMsg, basePath);
@@ -255,10 +257,11 @@ export class BybitClient {
       const ts = Date.now();
       const jsonBody = JSON.stringify(payload);
       const paramStr = buildPostParamStr(ts, this.apiKey, jsonBody);
-      const headers = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
+      const reqHeaders = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
       const url = `${this.baseUrl}${path}`;
       log.debug({ url, payload }, 'POST (auth)');
-      const res = await request(url, { method: 'POST', headers, body: jsonBody });
+      const res = await request(url, { method: 'POST', headers: reqHeaders, body: jsonBody });
+      rateLimiter.updateFromHeaders(res.headers as Record<string, string | string[]>, path);
       const body = await res.body.json() as BybitResponse<T>;
       if (body.retCode !== 0) {
         const err = new BybitApiError(body.retCode, body.retMsg, path);
@@ -274,10 +277,11 @@ export class BybitClient {
       const ts = Date.now();
       const jsonBody = JSON.stringify(payload);
       const paramStr = buildPostParamStr(ts, this.apiKey, jsonBody);
-      const headers = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
+      const reqHeaders = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
       const url = `${this.baseUrl}${path}`;
       log.debug({ url, payload }, 'BOT POST');
-      const res = await request(url, { method: 'POST', headers, body: jsonBody });
+      const res = await request(url, { method: 'POST', headers: reqHeaders, body: jsonBody });
+      rateLimiter.updateFromHeaders(res.headers as Record<string, string | string[]>, path);
       const body = await res.body.json() as BotResponse<T>;
       if (body.status_code === 503) {
         throw new BotApiError(503, 'Active investment cycle — retry later', path);
