@@ -99,7 +99,7 @@ export class DecisionEngine {
         VALUES (
           ${cycleId}::uuid, ${sig.symbol}, ${sig.action}, ${sig.strategy},
           ${sig.confidence}, ${snap ? classifyRegime(snap) : null},
-          ${sig.rationale}, ${inputs ? JSON.stringify(inputs) : null}::jsonb,
+          ${sig.rationale}, ${inputs ? sql.json(inputs) : null},
           ${sig.compositeScore}, null, null, false
         )
       `.catch(e => log.error({ e }, 'Failed to persist decision'));

@@ -6,6 +6,8 @@ import { MarketDataService } from '../market/MarketDataService';
 import { DecisionEngine } from '../strategy/DecisionEngine';
 import { RiskManager } from '../risk/RiskManager';
 import { PortfolioManager } from '../portfolio/PortfolioManager';
+import { PositionHealthManager } from '../positions/PositionHealthManager';
+import { ExecutionRouter } from '../execution/ExecutionRouter';
 import { BotManager } from '../bots/BotManager';
 import { CopyTradingManager } from '../copy/CopyTradingManager';
 import { SelfReview } from '../review/SelfReview';
@@ -33,6 +35,8 @@ export class AgentLoop {
   private readonly decisions: DecisionEngine;
   private readonly riskManager: RiskManager;
   private readonly portfolio: PortfolioManager;
+  private readonly positionHealth: PositionHealthManager;
+  private readonly execution: ExecutionRouter;
   private readonly bots: BotManager;
   private readonly copy: CopyTradingManager;
   private readonly review: SelfReview;
@@ -44,6 +48,8 @@ export class AgentLoop {
     this.decisions = new DecisionEngine();
     this.portfolio = new PortfolioManager(client);
     this.riskManager = new RiskManager(() => this.portfolio.getState());
+    this.positionHealth = new PositionHealthManager(client);
+    this.execution = new ExecutionRouter(client, false);
     this.bots = new BotManager(client, isTestnet);
     this.copy = new CopyTradingManager(client, isTestnet);
     this.review = new SelfReview();
@@ -81,7 +87,7 @@ export class AgentLoop {
     const cycleId = randomUUID();
     const cyclelog = log.child({ cycleId });
 
-    // ── 1. Check agent_state for manual pause/kill ────────────────────────────
+    // ── 1. Check agent_state for manual pause/kill ─────────────────────────
     const ag = await getDb()`SELECT * FROM agent_state WHERE id = 'singleton' LIMIT 1`.then(r => r[0]);
     if (ag?.kill_engaged) throw new KillSwitchError('Manual DB kill');
     if (ag?.status === 'paused') { cyclelog.info('Agent paused — skipping cycle'); return; }
@@ -90,7 +96,7 @@ export class AgentLoop {
     const isTestnet = currentEnv === 'testnet';
     this.client.setTestnet(isTestnet);
 
-    // ── 2. Hard limits ────────────────────────────────────────────────────────
+    // ── 2. Hard limits ────────────────────────────────────────────
     await this.portfolio.refresh();
     const { killTripped, dailyLimitHit, circuitBreaker } = await this.riskManager.checkHardLimits(cycleId);
     if (killTripped) {
@@ -98,19 +104,24 @@ export class AgentLoop {
       return;
     }
 
-    // ── 3. Market snapshots ───────────────────────────────────────────────────
+    // ── 3. Market snapshots ──────────────────────────────────────
     const snapshots = await Promise.all(
       WATCHED_SYMBOLS.map(s => this.market.getSnapshot(s, 'linear').catch(() => null))
     ).then(r => r.filter(Boolean) as Awaited<ReturnType<MarketDataService['getSnapshot']>>[]);
 
     if (snapshots.length === 0) { cyclelog.warn('No market data — skipping cycle'); return; }
 
-    // ── 4. Decisions ──────────────────────────────────────────────────────────
+    // ── 3b. Manage open positions (breakeven / trail / partial TP / time exit) ──
+    if (!this.killSwitch.isEngaged()) {
+      await this.positionHealth.tick(snapshots).catch(e => cyclelog.error({ e }, 'Position health error'));
+    }
+
+    // ── 4. Decisions ───────────────────────────────────────────
     const signals: WeightedSignal[] = dailyLimitHit
       ? []
       : await this.decisions.run(snapshots, cycleId);
 
-    // ── 5. Execute signals ────────────────────────────────────────────────────
+    // ── 5. Execute signals ──────────────────────────────────────
     for (const sig of signals) {
       if (this.killSwitch.isEngaged()) break;
       const snap = snapshots.find(s => s.symbol === sig.symbol);
@@ -120,10 +131,12 @@ export class AgentLoop {
       if (!instrument) continue;
 
       const approval = this.riskManager.approve(sig, instrument, circuitBreaker);
+      const econ = { ev: approval.ev ?? null, costPct: approval.costPct ?? null, rewardRisk: approval.rewardRisk ?? null };
       if (!approval.approved) {
         cyclelog.debug({ reason: approval.reason, symbol: sig.symbol }, 'Signal rejected');
         await getDb()`
-          UPDATE decision_log SET approved = false, reject_reason = ${approval.reason ?? null}
+          UPDATE decision_log SET approved = false, reject_reason = ${approval.reason ?? null},
+            inputs = COALESCE(inputs, '{}'::jsonb) || ${getDb().json(econ)}
           WHERE cycle_id = ${cycleId}::uuid AND symbol = ${sig.symbol} AND strategy = ${sig.strategy}
         `.catch(() => {});
         continue;
@@ -133,31 +146,33 @@ export class AgentLoop {
         const side = sig.action === 'enter_long' ? 'Buy' : 'Sell';
         const orderLinkId = `agent-${sig.strategy}-${sig.symbol}-${Date.now()}`;
 
-        const result = await this.client.placeOrder({
+        // Maker-first: rest a PostOnly limit, fall back to market if unfilled.
+        const result = await this.execution.enter({
           category: 'linear',
           symbol: sig.symbol,
           side,
-          orderType: 'Market',
-          qty: String(approval.qty),
-          stopLoss: approval.stopPrice ? String(approval.stopPrice) : undefined,
-          takeProfit: approval.tpPrice ? String(approval.tpPrice) : undefined,
-          positionIdx: 0,
+          qty: approval.qty,
+          refPrice: approval.stopPrice && sig.suggestedEntry ? sig.suggestedEntry : snap.lastPrice,
+          stopLoss: approval.stopPrice || undefined,
+          takeProfit: approval.tpPrice,
           orderLinkId,
         });
 
         await getDb()`
           INSERT INTO orders (decision_id, exchange_order_id, order_link_id, symbol, category, side, order_type, qty, is_paper)
-          SELECT id, ${result.orderId}, ${orderLinkId}, ${sig.symbol}, 'linear', ${side}, 'Market', ${approval.qty}, ${isTestnet}
+          SELECT id, ${result.orderId}, ${result.orderLinkId}, ${sig.symbol}, 'linear', ${side},
+            ${result.fillType === 'maker' ? 'Limit' : 'Market'}, ${approval.qty}, ${isTestnet}
           FROM decision_log WHERE cycle_id = ${cycleId}::uuid AND symbol = ${sig.symbol} AND strategy = ${sig.strategy}
           LIMIT 1
         `.catch(() => {});
 
         await getDb()`
-          UPDATE decision_log SET approved = true, outcome = 'executed'
+          UPDATE decision_log SET approved = true, outcome = 'executed',
+            inputs = COALESCE(inputs, '{}'::jsonb) || ${getDb().json(econ)}
           WHERE cycle_id = ${cycleId}::uuid AND symbol = ${sig.symbol} AND strategy = ${sig.strategy}
         `.catch(() => {});
 
-        cyclelog.info({ symbol: sig.symbol, side, qty: approval.qty, strategy: sig.strategy }, '✅ Order placed');
+        cyclelog.info({ symbol: sig.symbol, side, qty: approval.qty, strategy: sig.strategy, fill: result.fillType }, '✅ Order placed');
       } catch (e) {
         cyclelog.error({ e, symbol: sig.symbol }, 'Order failed');
         await getDb()`
@@ -167,18 +182,18 @@ export class AgentLoop {
       }
     }
 
-    // ── 6. Bot tick ───────────────────────────────────────────────────────────
+    // ── 6. Bot tick ───────────────────────────────────────────────
     if (!dailyLimitHit && !this.killSwitch.isEngaged()) {
       await this.bots.tick(snapshots, this.portfolio.getState()).catch(e => cyclelog.error({ e }, 'Bot tick error'));
     }
 
-    // ── 7. Copy trading tick ──────────────────────────────────────────────────
+    // ── 7. Copy trading tick ───────────────────────────────────────
     await this.copy.tick(this.portfolio.getState()).catch(e => cyclelog.error({ e }, 'Copy tick error'));
 
-    // ── 8. Self-review ────────────────────────────────────────────────────────
+    // ── 8. Self-review ───────────────────────────────────────────
     await this.review.tick(cycleId).catch(e => cyclelog.error({ e }, 'Review error'));
 
-    // ── 9. Promotion check ────────────────────────────────────────────────────
+    // ── 9. Promotion check ──────────────────────────────────────
     if (isTestnet) {
       const promoted = await this.promotion.evaluate().catch(() => false);
       if (promoted) {
@@ -187,7 +202,7 @@ export class AgentLoop {
       }
     }
 
-    // ── 10. Reports ───────────────────────────────────────────────────────────
+    // ── 10. Reports ────────────────────────────────────────────
     const now = Date.now();
     if (now - this.lastDailyReport > 24 * 60 * 60 * 1000) {
       this.lastDailyReport = now;
@@ -202,13 +217,13 @@ export class AgentLoop {
       buildAndSendReport('monthly').catch(e => cyclelog.error({ e }, 'Monthly report failed'));
     }
 
-    // ── 11. Repo update check ─────────────────────────────────────────────────
+    // ── 11. Repo update check ─────────────────────────────────────
     if (now - this.lastRepoCheck > REPO_POLL_INTERVAL_MS) {
       this.lastRepoCheck = now;
       checkAndUpdate().catch(e => cyclelog.warn({ e }, 'Repo check failed'));
     }
 
-    // ── 12. Update agent_state ────────────────────────────────────────────────
+    // ── 12. Update agent_state ────────────────────────────────────
     await getDb()`
       UPDATE agent_state SET last_cycle_at = now(), updated_at = now() WHERE id = 'singleton'
     `.catch(() => {});
