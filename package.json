@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src --ext .ts",
+    "simulate": "tsx src/simulation/run-simulation.ts",
     "postinstall": "tsx scripts/fetch-skill.ts || true"
   },
   "dependencies": {
