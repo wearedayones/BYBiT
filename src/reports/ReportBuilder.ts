@@ -55,7 +55,31 @@ export async function buildAndSendReport(period: 'daily' | 'weekly' | 'monthly')
 
     const html = buildHtml({
       period, now, totalPnl, latestEquity, maxDD,
-      trades, equity, riskEvents, botPerf, leaders,
+      trades: trades.map(t => ({
+        strategy: t.strategy,
+        pnl: parseFloat(String(t.pnl ?? 0)),
+        wins: parseInt(String(t.wins ?? 0), 10),
+        count: parseInt(String(t.count ?? 0), 10),
+      })),
+      equity: equity.map(e => ({
+        total_equity: parseFloat(String(e.total_equity ?? 0)),
+        drawdown_pct: parseFloat(String(e.drawdown_pct ?? 0)),
+        ts: e.ts,
+      })),
+      riskEvents: riskEvents.map(r => ({
+        type: r.type,
+        count: parseInt(String(r.count ?? 0), 10),
+      })),
+      botPerf: botPerf.map(b => ({
+        bot_type: b.bot_type,
+        realized_pnl: parseFloat(String(b.realized_pnl ?? 0)),
+        count: parseInt(String(b.count ?? 0), 10),
+      })),
+      leaders: leaders.map(l => ({
+        nickname: l.nickname,
+        score: parseFloat(String(l.score ?? 0)),
+        our_realized_pnl: parseFloat(String(l.our_realized_pnl ?? 0)),
+      })),
     });
 
     const subject = `[BYBiT Agent] ${capitalize(period)} Report — ${now.toDateString()} | PnL: $${totalPnl.toFixed(2)}`;
