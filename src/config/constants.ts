@@ -31,6 +31,40 @@ export const RISK_DEFAULTS = {
   MAX_CORRELATED_EXPOSURE: 0.30, // 30% of equity in correlated cluster
 } as const;
 
+// Bybit trading fees (VIP 0, fraction of notional). Source: bybit.com fee schedule.
+// Perp: 0.055% taker / 0.020% maker. Spot: 0.10% both sides.
+export const FEES = {
+  PERP_TAKER: 0.00055,
+  PERP_MAKER: 0.00020,
+  SPOT_TAKER: 0.001,
+  SPOT_MAKER: 0.001,
+} as const;
+
+// Cost / expectancy gating — a trade must clear its own friction with margin to spare.
+export const COST_DEFAULTS = {
+  SLIPPAGE_PCT: 0.0005,      // 0.05% per fill — matches the sim's slippage model
+  MIN_NET_EDGE_PCT: 0.0015,  // require ≥0.15% expected net move after all costs
+  MIN_REWARD_RISK: 1.2,      // reject trades whose TP can't clear costs vs the stop
+} as const;
+
+// Maker-first execution — try PostOnly limit, fall back to market if unfilled.
+export const EXECUTION_DEFAULTS = {
+  MAKER_WAIT_MS: 5_000,      // how long to wait for a PostOnly limit to fill (live)
+  MAKER_OFFSET_PCT: 0.0001,  // place limit 1 bps inside the touch to stay maker
+} as const;
+
+// Active position management knobs (PositionHealthManager).
+export const POSITION_MGMT = {
+  BREAKEVEN_AT_R: 1.0,       // move SL to entry once price is +1R in favor
+  BREAKEVEN_BUFFER_PCT: 0.0008, // nudge breakeven SL past entry to cover round-trip cost
+  TRAIL_START_R: 2.0,        // begin ATR trailing once +2R in favor
+  TRAIL_ATR_MULT: 2.0,       // trail this many ATRs behind the high-water mark
+  PARTIAL_TP_AT_R: 1.0,      // take partial profit at +1R
+  PARTIAL_TP_FRACTION: 0.5,  // close this fraction of the position at the partial TP
+  MAX_HOLD_CYCLES: 30,       // close a stale, ~flat position after this many cycles
+  STALE_PNL_R: 0.25,         // "≈ flat" threshold in R-multiples for the time exit
+} as const;
+
 export const PROMOTION_DEFAULTS = {
   MIN_CYCLES: 72,
   MIN_SHARPE: 0.5,

@@ -2,6 +2,9 @@ import Decimal from 'decimal.js';
 import { childLogger } from '../core/logger';
 import { getDb } from '../persistence/db';
 import { computePositionSize } from './sizing';
+import {
+  roundTripCostPct, expectedValue, MIN_NET_EDGE_PCT, MIN_REWARD_RISK,
+} from './CostModel';
 import type { WeightedSignal } from '../strategy/DecisionEngine';
 import type { InstrumentInfo } from '../exchange/types';
 
@@ -25,6 +28,9 @@ export interface ApprovalResult {
   reason?: string;
   stopPrice: number;
   tpPrice?: number;
+  costPct?: number;
+  ev?: number;
+  rewardRisk?: number;
 }
 
 export class RiskManager {
@@ -92,11 +98,40 @@ export class RiskManager {
       return { approved: false, qty: 0, reason: 'Max concurrent positions reached', stopPrice: signal.suggestedStop };
     }
 
+    // ── Expectancy gate ────────────────────────────────────────────
+    // A trade must clear its own friction with margin. Entry fills maker-first,
+    // SL/TP exits as taker, so cost = maker entry + taker exit + slippage.
+    const costPct = roundTripCostPct('linear', true, false);
+    const exp = expectedValue(signal, signal.learnedPrior, costPct);
+
+    // Funding-harvest legs earn funding, not a price target, so they carry no
+    // TP and are exempt from the reward:risk / EV price-move gate.
+    const isFundingHarvest = signal.strategy === 'funding_harvest';
+    if (exp && !isFundingHarvest) {
+      if (exp.rewardRisk < MIN_REWARD_RISK) {
+        return {
+          approved: false, qty: 0, stopPrice: signal.suggestedStop, tpPrice: signal.suggestedTp,
+          costPct, ev: exp.ev, rewardRisk: exp.rewardRisk,
+          reason: `Reward:risk ${exp.rewardRisk.toFixed(2)} below ${MIN_REWARD_RISK}`,
+        };
+      }
+      if (exp.ev < MIN_NET_EDGE_PCT) {
+        return {
+          approved: false, qty: 0, stopPrice: signal.suggestedStop, tpPrice: signal.suggestedTp,
+          costPct, ev: exp.ev, rewardRisk: exp.rewardRisk,
+          reason: `Negative expected value after costs (EV ${(exp.ev * 100).toFixed(3)}%)`,
+        };
+      }
+    }
+
     return {
       approved: true,
       qty: sizingResult.qty,
       stopPrice: signal.suggestedStop,
       tpPrice: signal.suggestedTp,
+      costPct,
+      ev: exp?.ev,
+      rewardRisk: exp?.rewardRisk,
     };
   }
 
