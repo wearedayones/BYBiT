@@ -4,11 +4,12 @@
  */
 import type { MarketSimulator, SimMarket } from './MarketSimulator';
 import type {
-  KlineItem, Ticker, Orderbook, WalletBalance, Position,
+  KlineItem, Ticker, Orderbook, WalletBalance, Position, Category,
   PlaceOrderRequest, OrderResult, ClosedPnlItem, InstrumentInfo, FundingRateItem,
 } from '../exchange/types';
 import { childLogger } from '../core/logger';
 import { getDb } from '../persistence/db';
+import { FEES, COST_DEFAULTS } from '../config/constants';
 
 const log = childLogger({ module: 'sim-client' });
 
@@ -21,12 +22,14 @@ interface SimPosition {
   strategy: string;
   stopLoss?: number;
   takeProfit?: number;
+  entryFeePerUnit: number;  // entry fee already paid, per unit of size (for net PnL)
 }
 
 interface VirtualAccount {
   balance: number;
   positions: Map<string, SimPosition>;
   closedTrades: Array<{ symbol: string; pnl: number; closedAt: Date }>;
+  feesPaid: number;
 }
 
 export class SimulatedBybitClient {
@@ -35,6 +38,7 @@ export class SimulatedBybitClient {
     balance: Number(process.env.SIM_START_CAPITAL ?? 10_000),
     positions: new Map(),
     closedTrades: [],
+    feesPaid: 0,
   };
 
   constructor(private readonly sim: MarketSimulator) {}
@@ -173,28 +177,48 @@ export class SimulatedBybitClient {
     // Extract strategy from order_link_id format: sim-{strategy}-{symbol}-{ts}
     const strategy = req.orderLinkId?.split('-')[1] ?? 'unknown';
 
-    // Check for existing position to close (reduceOnly)
+    // Maker = PostOnly limit (no slippage, maker fee); taker = market (slippage, taker fee).
+    const isMaker = req.orderType === 'Limit' && req.timeInForce === 'PostOnly';
+    const feeRate = isMaker ? FEES.PERP_MAKER : FEES.PERP_TAKER;
+
+    // Check for existing position to close (reduceOnly) — supports PARTIAL closes.
     const existing = this.account.positions.get(`${req.symbol}-${req.side === 'Buy' ? 'Sell' : 'Buy'}`);
     if (req.reduceOnly && existing) {
-      const pnl = (req.side === 'Sell' ? 1 : -1) * qty * (price - existing.avgEntry);
-      this.account.balance += pnl;
+      const exitPrice = isMaker ? price : price * (req.side === 'Buy' ? 1.0005 : 0.9995);
+      const closeQty = Math.min(qty, existing.size);
+      const grossPnl = (existing.side === 'Buy' ? 1 : -1) * closeQty * (exitPrice - existing.avgEntry);
+      const exitFee = closeQty * exitPrice * feeRate;
+      const entryFeePortion = existing.entryFeePerUnit * closeQty;
+      const netPnl = grossPnl - exitFee;
+      this.account.balance += netPnl;
+      this.account.feesPaid += exitFee;
       const closedAt = new Date();
-      this.account.closedTrades.push({ symbol: req.symbol, pnl, closedAt });
-      this.account.positions.delete(`${req.symbol}-${existing.side}`);
-      log.info({ symbol: req.symbol, side: req.side, qty, pnl: pnl.toFixed(2) }, '[SIM] Position closed');
-      this.persistTrade(req.symbol, existing.side, existing.avgEntry, price, qty, pnl, existing.strategy, existing.openedAt, closedAt).catch(() => {});
+      this.account.closedTrades.push({ symbol: req.symbol, pnl: netPnl, closedAt });
+
+      const fullClose = closeQty >= existing.size - 1e-12;
+      if (fullClose) this.account.positions.delete(`${req.symbol}-${existing.side}`);
+      else existing.size -= closeQty;
+
+      log.info({ symbol: req.symbol, side: req.side, qty: closeQty, netPnl: netPnl.toFixed(2), partial: !fullClose }, '[SIM] Position reduced');
+      this.persistTrade(req.symbol, existing.side, existing.avgEntry, exitPrice, closeQty, netPnl, entryFeePortion + exitFee, existing.strategy, existing.openedAt, closedAt).catch(() => {});
       return { orderId, orderLinkId };
     }
 
-    // Open/add to position (with 0.05% simulated slippage)
-    const slippage = req.side === 'Buy' ? 1.0005 : 0.9995;
-    const fillPrice = price * slippage;
+    // Open/add to position. Maker fills at the limit price; taker pays slippage.
+    const fillPrice = isMaker
+      ? (req.price ? parseFloat(req.price) : price)
+      : price * (req.side === 'Buy' ? 1.0005 : 0.9995);
+    const entryFee = qty * fillPrice * feeRate;
+    this.account.balance -= entryFee;
+    this.account.feesPaid += entryFee;
+
     const posKey = `${req.symbol}-${req.side}`;
     const existing2 = this.account.positions.get(posKey);
 
     if (existing2) {
       const totalQty = existing2.size + qty;
       existing2.avgEntry = (existing2.avgEntry * existing2.size + fillPrice * qty) / totalQty;
+      existing2.entryFeePerUnit = (existing2.entryFeePerUnit * existing2.size + (entryFee / qty) * qty) / totalQty;
       existing2.size = totalQty;
     } else {
       this.account.positions.set(posKey, {
@@ -202,27 +226,40 @@ export class SimulatedBybitClient {
         openedAt: new Date(), strategy,
         stopLoss: req.stopLoss ? parseFloat(req.stopLoss) : undefined,
         takeProfit: req.takeProfit ? parseFloat(req.takeProfit) : undefined,
+        entryFeePerUnit: entryFee / qty,
       });
     }
 
     log.info({
       symbol: req.symbol, side: req.side, qty, fillPrice: fillPrice.toFixed(2),
+      fill: isMaker ? 'maker' : 'taker', fee: entryFee.toFixed(4),
       sl: req.stopLoss, tp: req.takeProfit,
     }, '[SIM] Order filled');
     return { orderId, orderLinkId };
   }
 
+  /** Adjust a virtual position's stop-loss (mirrors BybitClient.setTradingStop). */
+  async setTradingStop(_category: Category, symbol: string, opts: {
+    stopLoss?: string; takeProfit?: string; trailingStop?: string; positionIdx?: number;
+  }): Promise<void> {
+    for (const pos of this.account.positions.values()) {
+      if (pos.symbol !== symbol) continue;
+      if (opts.stopLoss) pos.stopLoss = parseFloat(opts.stopLoss);
+      if (opts.takeProfit) pos.takeProfit = parseFloat(opts.takeProfit);
+    }
+  }
+
   private async persistTrade(
     symbol: string, side: string, entryPrice: number, exitPrice: number,
-    qty: number, pnl: number, strategy: string, openedAt: Date, closedAt: Date,
+    qty: number, pnl: number, fee: number, strategy: string, openedAt: Date, closedAt: Date,
   ): Promise<void> {
     try {
       const sql = getDb();
       await sql`
         INSERT INTO trades (strategy, symbol, category, side, entry_price, exit_price, qty, fee, realized_pnl, opened_at, closed_at, is_paper)
-        VALUES (${strategy}, ${symbol}, 'linear', ${side}, ${entryPrice}, ${exitPrice}, ${qty}, 0, ${pnl}, ${openedAt.toISOString()}, ${closedAt.toISOString()}, true)
+        VALUES (${strategy}, ${symbol}, 'linear', ${side}, ${entryPrice}, ${exitPrice}, ${qty}, ${fee}, ${pnl}, ${openedAt.toISOString()}, ${closedAt.toISOString()}, true)
       `;
-      log.info({ symbol, side, pnl: pnl.toFixed(2), strategy }, '[SIM] Trade persisted to DB');
+      log.info({ symbol, side, pnl: pnl.toFixed(2), fee: fee.toFixed(4), strategy }, '[SIM] Trade persisted to DB');
     } catch (e) {
       log.error({ e, symbol }, '[SIM] Failed to persist trade');
     }
@@ -234,7 +271,6 @@ export class SimulatedBybitClient {
   }
 
   async setLeverage(): Promise<void> {}
-  async setTradingStop(): Promise<void> {}
   async getOpenOrders(): Promise<unknown[]> { return []; }
   async switchPositionMode(): Promise<void> {}
 
@@ -297,14 +333,19 @@ export class SimulatedBybitClient {
       if (pos.takeProfit && pos.side === 'Sell' && price <= pos.takeProfit) { hit = true; hitType = 'TP'; }
 
       if (hit) {
+        // SL/TP execute as taker on the exchange — charge the taker fee net of PnL.
         const multiplier = pos.side === 'Buy' ? 1 : -1;
-        const pnl = multiplier * pos.size * (price - pos.avgEntry);
-        this.account.balance += pnl;
+        const grossPnl = multiplier * pos.size * (price - pos.avgEntry);
+        const exitFee = pos.size * price * FEES.PERP_TAKER;
+        const netPnl = grossPnl - exitFee;
+        this.account.balance += netPnl;
+        this.account.feesPaid += exitFee;
         const closedAt = new Date();
-        this.account.closedTrades.push({ symbol: pos.symbol, pnl, closedAt });
+        this.account.closedTrades.push({ symbol: pos.symbol, pnl: netPnl, closedAt });
         this.account.positions.delete(key);
-        log.info({ symbol: pos.symbol, hitType, pnl: pnl.toFixed(2), price: price.toFixed(2) }, `[SIM] ${hitType} hit`);
-        this.persistTrade(pos.symbol, pos.side, pos.avgEntry, price, pos.size, pnl, pos.strategy, pos.openedAt, closedAt).catch(() => {});
+        const totalFee = pos.entryFeePerUnit * pos.size + exitFee;
+        log.info({ symbol: pos.symbol, hitType, netPnl: netPnl.toFixed(2), price: price.toFixed(2) }, `[SIM] ${hitType} hit`);
+        this.persistTrade(pos.symbol, pos.side, pos.avgEntry, price, pos.size, netPnl, totalFee, pos.strategy, pos.openedAt, closedAt).catch(() => {});
       }
     }
   }
@@ -312,8 +353,9 @@ export class SimulatedBybitClient {
   getBalance(): number { return this.account.balance; }
   getVirtualPositions() { return [...this.account.positions.values()]; }
 
-  // Per-run realized PnL and closed-trade count (in-memory — this run only,
-  // NOT the cumulative `trades` table which spans every past simulation).
+  // Per-run realized PnL, closed-trade count, and fees paid (in-memory — this
+  // run only, NOT the cumulative `trades` table which spans every past run).
   getRealizedPnl(): number { return this.account.closedTrades.reduce((s, t) => s + t.pnl, 0); }
   getClosedTradeCount(): number { return this.account.closedTrades.length; }
+  getFeesPaid(): number { return this.account.feesPaid; }
 }

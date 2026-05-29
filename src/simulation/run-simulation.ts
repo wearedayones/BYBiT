@@ -11,6 +11,8 @@ import { SimulatedBybitClient } from './SimulatedBybitClient';
 import { MarketDataService } from '../market/MarketDataService';
 import { DecisionEngine, classifyRegime } from '../strategy/DecisionEngine';
 import { RiskManager } from '../risk/RiskManager';
+import { PositionHealthManager } from '../positions/PositionHealthManager';
+import { ExecutionRouter } from '../execution/ExecutionRouter';
 import { BotManager } from '../bots/BotManager';
 import { CopyTradingManager } from '../copy/CopyTradingManager';
 import { SelfReview } from '../review/SelfReview';
@@ -37,7 +39,7 @@ async function runSimulation() {
   logger.info('══════════════════════════════════════════════════════');
   logger.info('');
 
-  // ── Migrations ────────────────────────────────────────────────────────────
+  // ── Migrations ─────────────────────────────────────────────────────────────
   const sql = getDb();
   const migPath = join(process.cwd(), 'migrations', '0001_init.sql');
   if (existsSync(migPath)) {
@@ -58,6 +60,8 @@ async function runSimulation() {
   // ── Modules ───────────────────────────────────────────────────────────────
   const market  = new MarketDataService(client);
   const decisions = new DecisionEngine();
+  const positionHealth = new PositionHealthManager(simClient);
+  const execution = new ExecutionRouter(simClient, true);  // isSim: maker fills immediately
   const bots    = new BotManager(client, true);       // paper = true
   const copy    = new CopyTradingManager(client, true);
   const review  = new SelfReview();
@@ -72,7 +76,7 @@ async function runSimulation() {
   };
   const riskManager = new RiskManager(() => portfolioState);
 
-  // ── Main cycle ────────────────────────────────────────────────────────────
+  // ── Main cycle ─────────────────────────────────────────────────────────────
   let cycleNum = 0;
 
   while (cycleNum < MAX_CYCLES) {
@@ -129,6 +133,9 @@ async function runSimulation() {
       log.info(`  ${snap.symbol.padEnd(8)} $${snap.lastPrice.toFixed(2).padStart(10)} │ ${regime.toUpperCase().padEnd(16)} │ RSI:${snap.indicators.rsi14.toFixed(0)} ADX:${snap.indicators.adxValue.toFixed(0)} Funding:${(snap.fundingRate * 100).toFixed(4)}%`);
     }
 
+    // Manage open positions: breakeven / ATR trail / partial TP / time-exit.
+    await positionHealth.tick(snapshots).catch(() => {});
+
     // Hard limits
     const { killTripped, dailyLimitHit, circuitBreaker } = await riskManager.checkHardLimits(cycleId);
     if (killTripped) { log.fatal('🔴 KILL LEVEL HIT — stopping simulation'); break; }
@@ -168,8 +175,10 @@ async function runSimulation() {
         if (!instrument) continue;
         const approval = riskManager.approve(sig, instrument, circuitBreaker);
 
-        // Write approval result back to decision_log
-        await sql`UPDATE decision_log SET approved = ${approval.approved}, reject_reason = ${approval.reason ?? null}
+        // Write approval result + cost/expectancy back to decision_log for audit.
+        const econ = { ev: approval.ev ?? null, costPct: approval.costPct ?? null, rewardRisk: approval.rewardRisk ?? null };
+        await sql`UPDATE decision_log SET approved = ${approval.approved}, reject_reason = ${approval.reason ?? null},
+            inputs = COALESCE(inputs, '{}'::jsonb) || ${sql.json(econ)}
           WHERE cycle_id = ${cycleId}::uuid AND symbol = ${sig.symbol} AND strategy = ${sig.strategy}
         `.catch(() => {});
 
@@ -177,11 +186,14 @@ async function runSimulation() {
           log.info(`     ✗ ${sig.symbol} rejected: ${approval.reason}`);
           continue;
         }
-        await (simClient as unknown as import('../exchange/BybitClient').BybitClient).placeOrder({
-          category: 'linear', symbol: sig.symbol, side, orderType: 'Market',
-          qty: String(approval.qty),
-          stopLoss: approval.stopPrice ? String(approval.stopPrice.toFixed(2)) : undefined,
-          takeProfit: approval.tpPrice ? String(approval.tpPrice.toFixed(2)) : undefined,
+        // Maker-first entry via the execution router (PostOnly limit in sim).
+        const sigSnap = snapshots.find(s => s.symbol === sig.symbol);
+        await execution.enter({
+          category: 'linear', symbol: sig.symbol, side,
+          qty: approval.qty,
+          refPrice: sig.suggestedEntry ?? sigSnap?.lastPrice ?? 0,
+          stopLoss: approval.stopPrice || undefined,
+          takeProfit: approval.tpPrice,
           orderLinkId: `sim-${sig.strategy}-${sig.symbol}-${Date.now()}`,
         }).catch(() => {});
 
@@ -226,6 +238,7 @@ async function runSimulation() {
   const finalEquity = portfolioState.equity;
   const realizedPnl = simClient.getRealizedPnl();
   const closedTrades = simClient.getClosedTradeCount();
+  const feesPaid = simClient.getFeesPaid();
   const openPositions = simClient.getVirtualPositions().length;
   const netReturnPct = START_CAPITAL > 0 ? ((finalEquity - START_CAPITAL) / START_CAPITAL) * 100 : 0;
   const weights = await sql`SELECT strategy, weight FROM strategy_weights ORDER BY weight DESC`;
@@ -238,7 +251,8 @@ async function runSimulation() {
   logger.info(`    ├─ cash balance:    $${cashBalance.toFixed(2)}`);
   logger.info(`    └─ open positions:  $${openPnl.toFixed(2)} unrealized (${openPositions} open)`);
   logger.info(`  Closed trades:    ${closedTrades}`);
-  logger.info(`  Realized PnL:     $${realizedPnl.toFixed(2)}`);
+  logger.info(`  Realized PnL:     $${realizedPnl.toFixed(2)}  (net of fees)`);
+  logger.info(`  Fees paid:        $${feesPaid.toFixed(2)}`);
   logger.info('  Final strategy weights:');
   for (const w of weights) logger.info(`    ${w.strategy.padEnd(20)} ${w.weight.toFixed(3)}`);
   logger.info('══════════════════════════════════════════════════════');
