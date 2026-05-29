@@ -22,8 +22,8 @@ import type { PortfolioState } from '../risk/RiskManager';
 
 const log = childLogger({ module: 'simulation' });
 
-const CYCLE_MS = 8_000;  // 8 seconds per cycle — fast enough to see everything
-const MAX_CYCLES = 200;  // run for ~27 minutes then summarise
+const CYCLE_MS = Number(process.env.SIM_CYCLE_MS ?? 8_000);  // per-cycle delay
+const MAX_CYCLES = Number(process.env.SIM_MAX_CYCLES ?? 200); // total cycles then summarise
 
 async function runSimulation() {
   logger.info('');
@@ -63,8 +63,9 @@ async function runSimulation() {
   const review  = new SelfReview();
   const promote = new PromotionManager();
 
+  const START_CAPITAL = Number(process.env.SIM_START_CAPITAL ?? 10_000);
   let portfolioState: PortfolioState = {
-    equity: 10_000, peakEquity: 10_000, daySartEquity: 10_000,
+    equity: START_CAPITAL, peakEquity: START_CAPITAL, daySartEquity: START_CAPITAL,
     dailyRealizedPnl: 0, openPositionCount: 0,
     dailyLossLimit: 0.08, killLevelPct: 0.20,
     circuitBreakerPct: 0.10, maxRiskPct: 0.015,
@@ -118,8 +119,8 @@ async function runSimulation() {
     ).then(r => r.filter(Boolean) as Awaited<ReturnType<typeof market.getSnapshot>>[]);
 
     // Log header
-    const pnlStr = (equity - 10_000).toFixed(2);
-    const pnlSign = equity >= 10_000 ? '+' : '';
+    const pnlStr = (equity - START_CAPITAL).toFixed(2);
+    const pnlSign = equity >= START_CAPITAL ? '+' : '';
     log.info(`\n${'─'.repeat(58)}`);
     log.info(`  Cycle ${cycleNum.toString().padStart(3)} │ Equity: $${equity.toFixed(2)} (${pnlSign}$${pnlStr}) │ Positions: ${portfolioState.openPositionCount}`);
     for (const snap of snapshots) {
@@ -219,17 +220,25 @@ async function runSimulation() {
     await sleep(CYCLE_MS);
   }
 
-  // Final summary
-  const finalEquity = simClient.getBalance();
-  const totalTrades = await sql`SELECT COUNT(*) as n, SUM(realized_pnl) as pnl FROM trades WHERE is_paper = true`.then(r => r[0]);
+  // Final summary — THIS RUN ONLY (in-memory), not the cumulative `trades` table.
+  const cashBalance = simClient.getBalance();
+  const openPnl = portfolioState.equity - cashBalance;  // unrealized on still-open positions
+  const finalEquity = portfolioState.equity;
+  const realizedPnl = simClient.getRealizedPnl();
+  const closedTrades = simClient.getClosedTradeCount();
+  const openPositions = simClient.getVirtualPositions().length;
+  const netReturnPct = START_CAPITAL > 0 ? ((finalEquity - START_CAPITAL) / START_CAPITAL) * 100 : 0;
   const weights = await sql`SELECT strategy, weight FROM strategy_weights ORDER BY weight DESC`;
 
   logger.info('\n');
   logger.info('══════════════════════════════════════════════════════');
-  logger.info('  SIMULATION COMPLETE');
-  logger.info(`  Final balance:  $${finalEquity.toFixed(2)}`);
-  logger.info(`  Total trades:   ${totalTrades?.n ?? 0}`);
-  logger.info(`  Realized PnL:   $${parseFloat(totalTrades?.pnl ?? '0').toFixed(2)}`);
+  logger.info('  SIMULATION COMPLETE  (this run only)');
+  logger.info(`  Starting capital: $${START_CAPITAL.toFixed(2)}`);
+  logger.info(`  Final equity:     $${finalEquity.toFixed(2)}  (${netReturnPct >= 0 ? '+' : ''}${netReturnPct.toFixed(2)}%)`);
+  logger.info(`    ├─ cash balance:    $${cashBalance.toFixed(2)}`);
+  logger.info(`    └─ open positions:  $${openPnl.toFixed(2)} unrealized (${openPositions} open)`);
+  logger.info(`  Closed trades:    ${closedTrades}`);
+  logger.info(`  Realized PnL:     $${realizedPnl.toFixed(2)}`);
   logger.info('  Final strategy weights:');
   for (const w of weights) logger.info(`    ${w.strategy.padEnd(20)} ${w.weight.toFixed(3)}`);
   logger.info('══════════════════════════════════════════════════════');

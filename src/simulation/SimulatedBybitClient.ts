@@ -32,7 +32,7 @@ interface VirtualAccount {
 export class SimulatedBybitClient {
   private orderCounter = 1;
   private account: VirtualAccount = {
-    balance: 10_000,
+    balance: Number(process.env.SIM_START_CAPITAL ?? 10_000),
     positions: new Map(),
     closedTrades: [],
   };
@@ -311,4 +311,9 @@ export class SimulatedBybitClient {
 
   getBalance(): number { return this.account.balance; }
   getVirtualPositions() { return [...this.account.positions.values()]; }
+
+  // Per-run realized PnL and closed-trade count (in-memory — this run only,
+  // NOT the cumulative `trades` table which spans every past simulation).
+  getRealizedPnl(): number { return this.account.closedTrades.reduce((s, t) => s + t.pnl, 0); }
+  getClosedTradeCount(): number { return this.account.closedTrades.length; }
 }
