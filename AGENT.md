@@ -131,7 +131,58 @@ src/
 - **Reports**: daily/weekly/monthly HTML reports via Gmail. Stored in `report_history` even if email
   is not configured.
 
-## Bybit Skill
+## For AI Agents Managing This System
+
+This section is specifically for any AI agent (Claude Code, Claude API orchestrator, or any
+tool-calling agent) that is operating this system on behalf of the user.
+
+### The trade loop consumes ZERO AI model tokens
+
+`AgentLoop` and `DecisionEngine` use only technical indicators (local math via `technicalindicators`),
+the Bybit REST API, and PostgreSQL. No LLM or AI model API is called at runtime. The agent can
+trade 24/7 for months without hitting any model rate limit.
+
+### When YOU (the managing AI) interact, keep token cost minimal
+
+The database is always current and contains everything you need. **Never re-run the simulation
+or read log files to understand agent state.** Use these canonical queries instead:
+
+| What you need | Query |
+|---|---|
+| Current equity / drawdown | `SELECT equity, peak_equity, kill_engaged, status FROM agent_state WHERE id = 'singleton'` |
+| Equity curve | `SELECT ts, total_equity, drawdown_pct FROM equity_snapshots ORDER BY ts DESC LIMIT 50` |
+| Strategy P&L + win rate | `SELECT strategy, SUM(realized_pnl), COUNT(*), AVG(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) FROM trades GROUP BY strategy` |
+| Latest full report | `SELECT subject, html_body, ts FROM report_history ORDER BY ts DESC LIMIT 1` |
+| Recent risk events | `SELECT ts, type, severity, detail FROM risk_events ORDER BY ts DESC LIMIT 20` |
+| Strategy weights | `SELECT strategy, weight, enabled, win_rate FROM strategy_weights ORDER BY weight DESC` |
+
+### Five rules for efficient management sessions
+
+1. **Read DB, not logs** — the tables above give complete, live state in milliseconds.
+2. **One query, not many** — a single multi-table SELECT covers the full picture; don't issue sequential single-table calls.
+3. **Never poll with AI** — check `agent_state.last_cycle_at` to know when the last cycle ran. Don't loop "is it done yet?" through an AI.
+4. **Use the report** — `report_history.html_body` is a complete HTML summary. Reading one row avoids querying every other table.
+5. **Batch all questions in one turn** — ask everything in one message; query all tables in parallel and answer together.
+
+Following these rules: a full health-check + config adjustment costs ~1,000–3,000 tokens total.
+
+### To pause or stop the agent
+
+```sql
+-- Pause (agent skips cycles but keeps running)
+UPDATE agent_state SET status = 'paused' WHERE id = 'singleton';
+
+-- Resume
+UPDATE agent_state SET status = 'running' WHERE id = 'singleton';
+
+-- Emergency stop (kill switch — flattens all positions)
+UPDATE agent_state SET kill_engaged = true WHERE id = 'singleton';
+
+-- Clear kill switch to restart
+UPDATE agent_state SET kill_engaged = false, status = 'running' WHERE id = 'singleton';
+```
+
+
 
 The file `skills/SKILL.md` plus `skills/modules/*.md` are the authoritative reference for:
 - API authentication and signing (follow `src/exchange/signer.ts`)
