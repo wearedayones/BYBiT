@@ -39,17 +39,28 @@ export class SelfReview {
 
       if (stats.length < 1) return;
 
-      const totalPnl = stats.reduce((s, r) => s + (r.realized_pnl ?? 0), 0);
+      // postgres.js returns NUMERIC as strings — coerce all numeric fields
+      const normalised = stats.map(r => ({
+        strategy: r.strategy,
+        realized_pnl: parseFloat(String(r.realized_pnl ?? 0)),
+        count: parseInt(String(r.count), 10),
+        win_rate: parseFloat(String(r.win_rate ?? 0)),
+      }));
 
-      for (const row of stats) {
+      const totalPnl = normalised.reduce((s, r) => s + r.realized_pnl, 0);
+
+      for (const row of normalised) {
         if (row.count < MIN_TRADES_FOR_REVIEW) continue;
 
-        const currentWeight = await sql<{ weight: number }[]>`
+        const currentWeight = await sql<{ weight: string }[]>`
           SELECT weight FROM strategy_weights WHERE strategy = ${row.strategy}
-        `.then(r => r[0]?.weight ?? 1.0);
+        `.then(r => {
+          const w = parseFloat(String(r[0]?.weight ?? 1.0));
+          return isNaN(w) ? 1.0 : w;
+        });
 
         // Softmax-like update: good pnl relative to total → increase weight
-        const relativePerf = totalPnl !== 0 ? (row.realized_pnl ?? 0) / Math.abs(totalPnl) : 0;
+        const relativePerf = totalPnl !== 0 ? row.realized_pnl / Math.abs(totalPnl) : 0;
         const normalizedScore = 0.5 + relativePerf * 0.5;
         const newWeight = Math.max(MIN_WEIGHT, Math.min(MAX_WEIGHT,
           currentWeight * (1 - WEIGHT_ALPHA) + normalizedScore * WEIGHT_ALPHA * 2,
@@ -58,15 +69,16 @@ export class SelfReview {
         await sql`
           UPDATE strategy_weights
           SET weight = ${newWeight},
-              realized_pnl = ${row.realized_pnl ?? 0},
+              realized_pnl = ${row.realized_pnl},
               trades_count = ${row.count},
               win_rate = ${row.win_rate},
               last_adjusted_at = now()
           WHERE strategy = ${row.strategy}
         `;
+        log.info({ strategy: row.strategy, newWeight: newWeight.toFixed(3), winRate: row.win_rate.toFixed(2), trades: row.count }, 'Strategy weight updated');
 
         // Disable strategy if pnl is deeply negative
-        if ((row.realized_pnl ?? 0) / Math.abs(totalPnl || 1) < DRAWDOWN_DISABLE_THRESHOLD) {
+        if (row.realized_pnl / Math.abs(totalPnl || 1) < DRAWDOWN_DISABLE_THRESHOLD) {
           await sql`
             UPDATE strategy_weights
             SET enabled = false, cooldown_until = now() + INTERVAL '24 hours'

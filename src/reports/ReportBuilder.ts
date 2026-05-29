@@ -18,7 +18,8 @@ export async function buildAndSendReport(period: 'daily' | 'weekly' | 'monthly')
           SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
           COUNT(*) as count
         FROM trades
-        WHERE closed_at > now() - ${interval}::interval AND is_paper = false
+        WHERE closed_at > now() - ${interval}::interval
+          AND strategy IS NOT NULL AND strategy != 'unknown'
         GROUP BY strategy ORDER BY pnl DESC
       `,
       sql<{ total_equity: number; drawdown_pct: number; ts: string }[]>`
