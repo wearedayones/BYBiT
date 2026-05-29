@@ -7,11 +7,15 @@ const log = childLogger({ module: 'emailer' });
 
 function createTransport() {
   if (!env.REPORT_EMAIL || !env.REPORT_EMAIL_APP_PASSWORD) return null;
+  const host = (env as Record<string, string | undefined>).SMTP_HOST ?? 'smtp.gmail.com';
+  const port = parseInt((env as Record<string, string | undefined>).SMTP_PORT ?? '587', 10);
   return nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,
+    host, port,
+    secure: port === 465,
     auth: { user: env.REPORT_EMAIL, pass: env.REPORT_EMAIL_APP_PASSWORD },
+    connectionTimeout: 8_000,
+    greetingTimeout: 8_000,
+    socketTimeout: 10_000,
   });
 }
 

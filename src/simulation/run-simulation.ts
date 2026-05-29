@@ -210,10 +210,10 @@ async function runSimulation() {
       }
     }
 
-    // After 50 cycles, trigger a report
-    if (cycleNum === 50) {
+    // Every 50 cycles generate a report
+    if (cycleNum % 50 === 0) {
       log.info('\n  📧 Generating report preview…');
-      await buildAndSendReport('daily').catch(() => {});
+      await buildAndSendReport('daily').catch(e => log.error({ e }, 'Report failed'));
     }
 
     await sleep(CYCLE_MS);
