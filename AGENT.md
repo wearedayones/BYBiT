@@ -36,6 +36,7 @@ so it survives full server migrations.
 | `REPORT_EMAIL` | Gmail address for daily/weekly/monthly reports |
 | `REPORT_EMAIL_APP_PASSWORD` | Gmail App Password (not your main password) |
 | `GITHUB_TOKEN` | Optional — for private repos or higher GitHub API rate limit |
+| `NEWS_API_KEY` | Optional — newsapi.org key for richer news sentiment (free tier works) |
 
 Copy `.env.example` → `.env` and fill these in. No other configuration needed.
 
@@ -60,7 +61,8 @@ src/
 │   └── constants.ts          — rate limits, URLs, risk defaults
 ├── skill/
 │   ├── skillLoader.ts        — reads skills/SKILL.md + modules/*, exposes config
-│   └── skillUpdater.ts       — checks remote version, self-updates skill files
+│   ├── skillUpdater.ts       — checks remote version, self-updates skill files
+│   └── SkillCompatChecker.ts — diffs endpoint registry, finds impacted src/ files, writes agentInstruction
 ├── exchange/
 │   ├── signer.ts             — HMAC-SHA256 signing (pure, unit-tested)
 │   ├── rateLimiter.ts        — GET/POST rate limiting with backoff
@@ -68,6 +70,7 @@ src/
 │   └── types.ts              — TypeScript types for all API shapes
 ├── market/
 │   ├── MarketDataService.ts  — klines, tickers, orderbook, indicators, regime classification
+│   ├── NewsResearchService.ts — Fear & Greed, CoinGecko trending, headline sentiment (15-min cache)
 │   └── indicators.ts         — adapter over technicalindicators library
 ├── strategy/
 │   ├── Strategy.ts           — Strategy interface + Signal/Action types
@@ -119,6 +122,8 @@ src/
 | `risk_events` | All risk limit hits, circuit breakers, kill switches |
 | `repo_updates` | Record of every self-update from GitHub |
 | `report_history` | Every email report sent |
+| `market_sentiment` | Fear & Greed Index + headline sentiment per cycle |
+| `skill_update_events` | Bybit API change diffs + agentInstruction for fixing breaking changes |
 
 ## Key Behaviors
 
@@ -130,6 +135,10 @@ src/
   it to resume. The loop checks this at the top of every cycle.
 - **Reports**: daily/weekly/monthly HTML reports via Gmail. Stored in `report_history` even if email
   is not configured.
+- **News research**: Fear & Greed Index, CoinGecko trending, and headline sentiment fetched every
+  cycle (cached 15 min) and factored into every trading decision as a sentiment multiplier.
+- **Skill adaptation**: when Bybit updates their API, SkillCompatChecker diffs the endpoint registry,
+  finds impacted src/ files, and writes a plain-English repair guide to `skill_update_events.agent_instruction`.
 
 ## For AI Agents Managing This System
 
@@ -155,6 +164,8 @@ or read log files to understand agent state.** Use these canonical queries inste
 | Latest full report | `SELECT subject, html_body, ts FROM report_history ORDER BY ts DESC LIMIT 1` |
 | Recent risk events | `SELECT ts, type, severity, detail FROM risk_events ORDER BY ts DESC LIMIT 20` |
 | Strategy weights | `SELECT strategy, weight, enabled, win_rate FROM strategy_weights ORDER BY weight DESC` |
+| Market sentiment | `SELECT ts, fear_greed_index, fear_greed_label, global_sentiment, trending_symbols FROM market_sentiment ORDER BY ts DESC LIMIT 1` |
+| Skill compat / API changes | `SELECT ts, old_version, new_version, breaking, agent_instruction FROM skill_update_events ORDER BY ts DESC LIMIT 5` |
 
 ### Five rules for efficient management sessions
 
@@ -192,4 +203,5 @@ The file `skills/SKILL.md` plus `skills/modules/*.md` are the authoritative refe
 - Security rules (never hardcode keys, never enable Withdraw)
 
 The skill is auto-updated at startup via `src/skill/skillUpdater.ts`. If a breaking change is
-detected, the agent pauses new entries and fires an email alert.
+detected, the agent pauses new entries and fires an email alert with the exact `agent_instruction`
+needed to fix the code.

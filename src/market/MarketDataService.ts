@@ -5,6 +5,8 @@ import type { KlineItem, Ticker, Orderbook, InstrumentInfo, FundingRateItem } fr
 import { ema, rsi, macd, atr, bollinger, adx, last } from './indicators';
 import type { OHLCVData } from './indicators';
 import { request } from 'undici';
+import { NewsResearchService } from './NewsResearchService';
+import type { ResearchData } from './NewsResearchService';
 
 const log = childLogger({ module: 'market' });
 
@@ -25,6 +27,7 @@ export interface MarketSnapshot {
   };
   orderbook: { bidDepth: number; askDepth: number; imbalance: number };
   openInterest?: number;
+  research?: ResearchData;
 }
 
 export type Regime = 'trending' | 'ranging' | 'high_volatility' | 'crisis';
@@ -32,18 +35,22 @@ export type Regime = 'trending' | 'ranging' | 'high_volatility' | 'crisis';
 export class MarketDataService {
   private readonly snapshotCache = new Map<string, { data: MarketSnapshot; expiresAt: number }>();
   private readonly instrumentCache = new Map<string, { data: InstrumentInfo; expiresAt: number }>();
+  private readonly newsResearch: NewsResearchService;
 
-  constructor(private readonly client: BybitClient) {}
+  constructor(private readonly client: BybitClient, newsApiKey?: string) {
+    this.newsResearch = new NewsResearchService(newsApiKey);
+  }
 
   async getSnapshot(symbol: string, category: 'spot' | 'linear' = 'linear'): Promise<MarketSnapshot> {
     const cached = this.snapshotCache.get(symbol);
     if (cached && Date.now() < cached.expiresAt) return cached.data;
 
-    const [klines, ticker, orderbook, funding] = await Promise.all([
+    const [klines, ticker, orderbook, funding, research] = await Promise.all([
       this.client.getKline(category, symbol, '15', 200),
       this.client.getTicker(category, symbol),
       this.client.getOrderbook(category, symbol, 50),
       this.getFundingRatePublic(symbol).catch(() => 0),
+      this.newsResearch.getResearch(symbol).catch(() => undefined),
     ]);
 
     const ohlcv = klinesToOhlcv(klines);
@@ -62,6 +69,7 @@ export class MarketDataService {
       indicators,
       orderbook: { bidDepth, askDepth, imbalance },
       openInterest: parseFloat(ticker?.openInterest ?? '0') || undefined,
+      research,
     };
 
     this.snapshotCache.set(symbol, { data: snap, expiresAt: Date.now() + 30_000 });

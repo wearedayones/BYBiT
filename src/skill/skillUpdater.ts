@@ -2,6 +2,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { childLogger } from '../core/logger';
 import { getDb } from '../persistence/db';
+import { runCompatCheck } from './SkillCompatChecker';
 
 const log = childLogger({ module: 'skill-updater' });
 const RAW_BASE = 'https://raw.githubusercontent.com/bybit-exchange/skills/main';
@@ -60,26 +61,13 @@ export async function checkAndUpdateSkill(currentVersion: string): Promise<void>
     }
 
     const newContent = readFileSync(skillPath, 'utf8');
+
+    // Run full compatibility check — diffs endpoints, finds impacted files, writes agentInstruction
+    await runCompatCheck(currentVersion, remoteVersion, oldEndpoints.join('\n'), newContent);
+
     const newEndpoints = extractEndpoints(newContent);
-    const removed = oldEndpoints.filter(e => !newEndpoints.includes(e));
     const added = newEndpoints.filter(e => !oldEndpoints.includes(e));
-    const breaking = removed.length > 0;
-
-    const sql = getDb();
-    await sql`
-      INSERT INTO skill_update_events (old_version, new_version, endpoint_diffs, breaking, description)
-      VALUES (${currentVersion}, ${remoteVersion},
-        ${JSON.stringify({ removed, added })}::jsonb,
-        ${breaking},
-        ${breaking ? `Breaking: removed endpoints: ${removed.join(', ')}` : `Non-breaking: added ${added.length} endpoints`}
-      )
-    `;
-
-    if (breaking) {
-      log.error({ removed }, '⚠️  Breaking skill change detected — pausing new entries');
-    } else {
-      log.info({ added }, 'Skill updated (non-breaking)');
-    }
+    log.info({ version: remoteVersion, added: added.length }, 'Skill update complete');
   } catch (err) {
     log.warn({ err }, 'Skill update check failed — using current version');
   }

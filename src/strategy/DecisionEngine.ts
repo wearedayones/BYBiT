@@ -3,6 +3,7 @@ import type { MarketSnapshot, Regime } from '../market/MarketDataService';
 import { TrendMomentum } from './impl/TrendMomentum';
 import { MeanReversion } from './impl/MeanReversion';
 import { Breakout } from './impl/Breakout';
+import { computeSentimentMultiplier } from '../market/NewsResearchService';
 import { FundingHarvest } from './impl/FundingHarvest';
 import { childLogger } from '../core/logger';
 import { getDb } from '../persistence/db';
@@ -15,6 +16,8 @@ export interface WeightedSignal extends Signal {
   compositeScore: number;
   weight: number;
   learnedPrior: number;
+  sentimentMultiplier: number;
+  trendingBoost: number;
 }
 
 export interface StrategyWeightRow {
@@ -53,14 +56,24 @@ export class DecisionEngine {
         const regimeMultiplier = strategy.suitableRegimes.includes(regime) ? 1.0 : 0.3;
         const weight = wRow?.weight ?? 1.0;
         const learnedPrior = ctx.learnedPrior;
-        const recencyDecay = 0.85; // down-weight old learned data
+        const recencyDecay = 0.85;
+
+        const sentimentMultiplier = signal.action === 'enter_long' || signal.action === 'enter_short'
+          ? computeSentimentMultiplier(snap.research, signal.action)
+          : 1.0;
+
+        const trendingBoost = snap.research?.trendingRank != null
+          ? 1.10
+          : 1.0;
 
         const compositeScore =
-          signal.confidence * weight * regimeMultiplier * (learnedPrior * recencyDecay + (1 - recencyDecay));
+          signal.confidence * weight * regimeMultiplier
+          * (learnedPrior * recencyDecay + (1 - recencyDecay))
+          * sentimentMultiplier * trendingBoost;
 
         if (compositeScore < CONFIDENCE_FLOOR) continue;
 
-        results.push({ ...signal, compositeScore, weight, learnedPrior });
+        results.push({ ...signal, compositeScore, weight, learnedPrior, sentimentMultiplier, trendingBoost });
       }
     }
 
@@ -70,13 +83,23 @@ export class DecisionEngine {
     // Persist to decision_log
     for (const sig of results) {
       const snap = snapshots.find(s => s.symbol === sig.symbol);
+      const inputs = snap ? {
+        ...snap.indicators,
+        sentimentMultiplier: sig.sentimentMultiplier,
+        trendingBoost: sig.trendingBoost,
+        fearGreedIndex: snap.research?.fearGreedIndex,
+        fearGreedLabel: snap.research?.fearGreedLabel,
+        symbolSentimentScore: snap.research?.symbolSentimentScore,
+        trendingRank: snap.research?.trendingRank,
+      } : null;
+
       await sql`
         INSERT INTO decision_log (cycle_id, symbol, action, strategy, confidence, regime,
           rationale, inputs, composite_score, approved, outcome, is_paper)
         VALUES (
           ${cycleId}::uuid, ${sig.symbol}, ${sig.action}, ${sig.strategy},
           ${sig.confidence}, ${snap ? classifyRegime(snap) : null},
-          ${sig.rationale}, ${snap ? JSON.stringify(snap.indicators) : null}::jsonb,
+          ${sig.rationale}, ${inputs ? JSON.stringify(inputs) : null}::jsonb,
           ${sig.compositeScore}, null, null, false
         )
       `.catch(e => log.error({ e }, 'Failed to persist decision'));

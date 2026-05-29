@@ -26,6 +26,7 @@ const schema = z.object({
   REPORT_EMAIL: z.string().email().optional(),
   REPORT_EMAIL_APP_PASSWORD: z.string().optional(),
   GITHUB_TOKEN: z.string().optional(),
+  NEWS_API_KEY: z.string().optional(),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   LOG_LEVEL: z.string().default('info'),
 });

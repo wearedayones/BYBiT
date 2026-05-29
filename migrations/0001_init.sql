@@ -312,15 +312,27 @@ CREATE TABLE IF NOT EXISTS repo_updates (
 );
 
 CREATE TABLE IF NOT EXISTS skill_update_events (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  ts            TIMESTAMPTZ DEFAULT now(),
-  old_version   TEXT,
-  new_version   TEXT,
-  endpoint_diffs JSONB,
-  breaking      BOOLEAN DEFAULT false,
-  description   TEXT,
-  email_sent    BOOLEAN DEFAULT false
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ts               TIMESTAMPTZ DEFAULT now(),
+  old_version      TEXT,
+  new_version      TEXT,
+  endpoint_diffs   JSONB,
+  breaking         BOOLEAN DEFAULT false,
+  description      TEXT,
+  agent_instruction TEXT,
+  email_sent       BOOLEAN DEFAULT false
 );
+
+CREATE TABLE IF NOT EXISTS market_sentiment (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ts                  TIMESTAMPTZ DEFAULT now(),
+  fear_greed_index    INT,
+  fear_greed_label    TEXT,
+  global_sentiment    NUMERIC,
+  trending_symbols    TEXT[],
+  source_detail       JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_sentiment_ts ON market_sentiment (ts);
 
 CREATE TABLE IF NOT EXISTS report_history (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
