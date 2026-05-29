@@ -11,46 +11,47 @@ export async function buildAndSendReport(period: 'daily' | 'weekly' | 'monthly')
   const now = new Date();
 
   try {
+    // Each query falls back to [] so one failure doesn't abort the whole report
     const [trades, equity, riskEvents, botPerf, leaders] = await Promise.all([
-      sql<{ strategy: string; pnl: number; wins: number; count: number }[]>`
+      sql<{ strategy: string; pnl: string; wins: string; count: string }[]>`
         SELECT strategy,
-          ROUND(SUM(realized_pnl)::numeric, 2) as pnl,
-          SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
-          COUNT(*) as count
+          SUM(realized_pnl)::text as pnl,
+          SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END)::text as wins,
+          COUNT(*)::text as count
         FROM trades
         WHERE closed_at > now() - ${interval}::interval
           AND strategy IS NOT NULL AND strategy != 'unknown'
-        GROUP BY strategy ORDER BY pnl DESC
-      `,
-      sql<{ total_equity: number; drawdown_pct: number; ts: string }[]>`
-        SELECT total_equity, drawdown_pct, ts
+        GROUP BY strategy ORDER BY SUM(realized_pnl) DESC NULLS LAST
+      `.catch(() => []),
+      sql<{ total_equity: string; drawdown_pct: string; ts: string }[]>`
+        SELECT total_equity::text, drawdown_pct::text, ts
         FROM equity_snapshots
         WHERE ts > now() - ${interval}::interval
         ORDER BY ts ASC LIMIT 500
-      `,
-      sql<{ count: number; type: string }[]>`
-        SELECT type, COUNT(*) as count FROM risk_events
+      `.catch(() => []),
+      sql<{ count: string; type: string }[]>`
+        SELECT type, COUNT(*)::text as count FROM risk_events
         WHERE ts > now() - ${interval}::interval GROUP BY type
-      `,
-      sql<{ bot_type: string; realized_pnl: number; count: number }[]>`
-        SELECT bi.bot_type, ROUND(SUM(bp.realized_pnl)::numeric, 2) as realized_pnl, COUNT(*) as count
+      `.catch(() => []),
+      sql<{ bot_type: string; realized_pnl: string; count: string }[]>`
+        SELECT bi.bot_type, COALESCE(SUM(bp.realized_pnl),0)::text as realized_pnl, COUNT(*)::text as count
         FROM bot_performance bp JOIN bot_instances bi ON bp.bot_instance_id = bi.id
         WHERE bp.ts > now() - ${interval}::interval GROUP BY bi.bot_type
-      `,
-      sql<{ nickname: string; score: number; our_realized_pnl: number }[]>`
-        SELECT cl.nickname, cl.score, COALESCE(SUM(clp.our_realized_pnl),0) as our_realized_pnl
+      `.catch(() => []),
+      sql<{ nickname: string; score: string; our_realized_pnl: string }[]>`
+        SELECT cl.nickname, cl.score::text, COALESCE(SUM(clp.our_realized_pnl),0)::text as our_realized_pnl
         FROM copy_leaders cl
         LEFT JOIN copy_leader_performance clp ON clp.copy_leader_id = cl.id
           AND clp.ts > now() - ${interval}::interval
         WHERE cl.status = 'following'
         GROUP BY cl.nickname, cl.score
-        ORDER BY our_realized_pnl DESC
-      `,
+        ORDER BY COALESCE(SUM(clp.our_realized_pnl),0) DESC
+      `.catch(() => []),
     ]);
 
-    const totalPnl = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
-    const latestEquity = equity[equity.length - 1]?.total_equity ?? 0;
-    const maxDD = Math.max(...equity.map(e => e.drawdown_pct ?? 0), 0);
+    const totalPnl = trades.reduce((s, t) => s + parseFloat(t.pnl ?? '0'), 0);
+    const latestEquity = parseFloat(equity[equity.length - 1]?.total_equity ?? '0');
+    const maxDD = equity.reduce((m, e) => Math.max(m, parseFloat(e.drawdown_pct ?? '0')), 0);
 
     const html = buildHtml({
       period, now, totalPnl, latestEquity, maxDD,
