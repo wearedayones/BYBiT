@@ -235,6 +235,31 @@ Final score: `confidence × strategy_weight × regime_fit × sentiment × learne
 
 All factors logged to `decision_log.inputs` for full auditability.
 
+### Cost-Aware Decisions (every trade must pay for itself)
+
+A directionally-correct trade still loses if fees and slippage exceed its edge. Before any
+order is approved the agent computes its **expected value net of costs**:
+
+- Bybit fees are modelled explicitly — **0.055% taker / 0.020% maker** on perps, plus slippage.
+- A trade is rejected if its **reward:risk < 1.2** or its **expected value after costs is negative**.
+- The EV, cost, and reward:risk of every decision are written to `decision_log.inputs`
+  (`SELECT inputs->>'ev', inputs->>'rewardRisk' FROM decision_log WHERE approved = true`).
+
+### Active Position Management (winners run, losers and dead trades are culled)
+
+Open positions are managed every cycle, not abandoned after entry:
+
+- **Break-even at +1R** — the stop moves to entry (plus a cost buffer) once the trade is safe.
+- **ATR trailing at +2R** — the stop trails behind the high-water mark to lock in gains.
+- **Partial take-profit at +1R** — half the position is banked; the rest runs on the trail.
+- **Time / regime exit** — stale, ≈flat trades and ones the trend turned against are closed.
+
+### Maker-First Execution
+
+Entries rest a **PostOnly limit order** to pay the maker fee (0.020%) instead of crossing the
+spread as a taker (0.055%); if it doesn't fill within a few seconds the agent falls back to a
+market order. Roughly halves the entry cost on non-urgent fills.
+
 ### Self-Learning
 
 - Every cycle: strategy weights updated from recent PnL (smoothed, floors + caps)
