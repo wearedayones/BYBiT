@@ -287,7 +287,8 @@ def bollinger(values: list[float], period: int = 20, std_dev: float = 2) -> list
             assert s is not None
             upper = mean + s * std_dev
             lower = mean - s * std_dev
-            out.append(BollResult(upper=upper, middle=mean, lower=lower, pb=(v - lower) / (upper - lower)))
+            out.append(BollResult(upper=upper, middle=mean, lower=lower,
+                                  pb=(v - lower) / (upper - lower) if upper != lower else 0.5))
     return out
 
 
@@ -323,7 +324,7 @@ def adx(ohlcv: OHLCV, period: int = 14) -> list[ADXResult]:
             last_mdi = s_mdm * 100 / s_tr
             di_diff = abs(last_pdi - last_mdi)
             di_sum = last_pdi + last_mdi
-            dx = (di_diff / di_sum) * 100
+            dx = (di_diff / di_sum) * 100 if di_sum > 0 else 0.0
             smoothed = ema_dx.next_value(dx)
             if smoothed is not None:
                 out.append(ADXResult(adx=smoothed, pdi=last_pdi, mdi=last_mdi))

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from ..base import Signal, StrategyContext
 
-FUNDING_THRESHOLD_ANNUALIZED = 0.50  # 50% APR
+FUNDING_THRESHOLD_ANNUALIZED = 0.10  # 10% APR (~0.027% per 8h funding payment)
 
 
 class FundingHarvest:
     name = "funding_harvest"
-    suitable_regimes = ["trending", "ranging", "high_volatility"]
+    suitable_regimes = ["trending", "ranging", "high_volatility", "crisis"]
 
     def evaluate(self, snap, ctx: StrategyContext) -> Signal:
         funding_rate = snap.fundingRate

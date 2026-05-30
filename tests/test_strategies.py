@@ -73,5 +73,5 @@ def test_classify_regime_matches_thresholds():
     assert classify_regime(_snap(adxValue=30, atrPct=0.01)) == "trending"
     assert classify_regime(_snap(adxValue=10, atrPct=0.03)) == "high_volatility"
     assert classify_regime(_snap(adxValue=10, atrPct=0.01)) == "ranging"
-    assert classify_regime(_snap(adxValue=10, atrPct=0.06)) == "crisis"
+    assert classify_regime(_snap(adxValue=10, atrPct=0.09)) == "crisis"
     assert classify_regime(_snap(funding=0.003)) == "crisis"

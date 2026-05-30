@@ -7,7 +7,7 @@ from ..base import Signal, StrategyContext
 
 class MeanReversion:
     name = "mean_reversion"
-    suitable_regimes = ["ranging"]
+    suitable_regimes = ["ranging", "crisis"]
 
     def evaluate(self, snap, ctx: StrategyContext) -> Signal:
         i = snap.indicators

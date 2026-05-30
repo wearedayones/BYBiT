@@ -108,8 +108,9 @@ def classify_regime(snap: MarketSnapshot) -> Regime:
     adx_value = snap.indicators.adxValue
     atr_pct = snap.indicators.atrPct
     funding_abs = abs(snap.fundingRate)
-    # Crisis = chaotic extreme volatility (high ATR without direction) OR funding blowout.
-    if (atr_pct > 0.05 and adx_value < 25) or funding_abs > 0.002:
+    # Crisis = extreme ATR without direction OR funding blowout.
+    # 8% threshold keeps normal crypto vol out of crisis; 0.002 funding = ~220% APR.
+    if (atr_pct > 0.08 and adx_value < 25) or funding_abs > 0.002:
         return "crisis"
     if adx_value > 25:
         return "trending"
