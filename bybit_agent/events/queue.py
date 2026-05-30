@@ -44,13 +44,14 @@ async def enqueue(
     expires_at = datetime.now(timezone.utc) + (ttl or _DEFAULT_TTL.get(kind, timedelta(hours=24)))
     event_id = str(uuid.uuid4())
     try:
-        await db.execute(
+        rows = await db.fetch(
             """INSERT INTO pending_events
                  (id, kind, severity, symbol, cycle_id, title, summary,
                   context, options, default_action, expires_at, dedupe_key)
                VALUES ($1, $2, $3, $4, $5::uuid, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12)
                ON CONFLICT (dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL
-               DO NOTHING""",
+               DO NOTHING
+               RETURNING id""",
             event_id, kind, severity, symbol,
             cycle_id, title, summary,
             json.dumps(context or {}),
@@ -59,6 +60,9 @@ async def enqueue(
             expires_at.isoformat(),
             dedupe_key,
         )
+        if not rows:
+            log.debug("Event deduped", kind=kind, dedupe_key=dedupe_key)
+            return None
         log.info("Event enqueued", kind=kind, title=title, id=event_id)
         return event_id
     except Exception as e:

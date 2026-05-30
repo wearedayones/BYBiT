@@ -26,37 +26,7 @@ class FakeDb:
     async def execute(self, sql: str, *args) -> None:
         sql_upper = sql.upper().strip()
 
-        if "INSERT INTO PENDING_EVENTS" in sql_upper and "ON CONFLICT" in sql_upper:
-            # enqueue — extract values from positional args
-            # args: id, kind, severity, symbol, cycle_id, title, summary,
-            #       context, options, default_action, expires_at, dedupe_key
-            (ev_id, kind, severity, symbol, cycle_id, title, summary,
-             context_s, options_s, default_action, expires_at_s, dedupe_key) = args
-
-            # Dedup: reject if a pending event with same dedupe_key exists
-            if dedupe_key:
-                for row in self._rows.values():
-                    if (row.get("dedupe_key") == dedupe_key
-                            and row.get("status") == "pending"):
-                        return  # ON CONFLICT DO NOTHING
-
-            expires_at = datetime.fromisoformat(expires_at_s.replace("Z", "+00:00"))
-            self._rows[ev_id] = {
-                "id": ev_id, "kind": kind, "severity": severity,
-                "symbol": symbol, "cycle_id": cycle_id,
-                "title": title, "summary": summary,
-                "context": json.loads(context_s),
-                "options": json.loads(options_s),
-                "default_action": default_action,
-                "expires_at": expires_at,
-                "dedupe_key": dedupe_key,
-                "status": "pending",
-                "resolution": None,
-                "resolved_at": None,
-                "ts": datetime.now(timezone.utc),
-            }
-
-        elif "UPDATE PENDING_EVENTS" in sql_upper and "STATUS = $1" in sql_upper:
+        if "UPDATE PENDING_EVENTS" in sql_upper and "STATUS = $1" in sql_upper:
             # resolve_event — args: status, resolution_json, event_id
             new_status, resolution_s, ev_id = args
             row = self._rows.get(ev_id)
@@ -76,6 +46,35 @@ class FakeDb:
 
     async def fetch(self, sql: str, *args) -> list[dict]:
         sql_upper = sql.upper().strip()
+
+        if "INSERT INTO PENDING_EVENTS" in sql_upper and "RETURNING ID" in sql_upper:
+            # enqueue — args: id, kind, severity, symbol, cycle_id, title, summary,
+            #                  context, options, default_action, expires_at, dedupe_key
+            (ev_id, kind, severity, symbol, cycle_id, title, summary,
+             context_s, options_s, default_action, expires_at_s, dedupe_key) = args
+
+            # Simulate ON CONFLICT DO NOTHING for the partial unique index.
+            if dedupe_key:
+                for row in self._rows.values():
+                    if row.get("dedupe_key") == dedupe_key and row.get("status") == "pending":
+                        return []  # conflict — RETURNING returns no rows
+
+            expires_at = datetime.fromisoformat(expires_at_s.replace("Z", "+00:00"))
+            self._rows[ev_id] = {
+                "id": ev_id, "kind": kind, "severity": severity,
+                "symbol": symbol, "cycle_id": cycle_id,
+                "title": title, "summary": summary,
+                "context": json.loads(context_s),
+                "options": json.loads(options_s),
+                "default_action": default_action,
+                "expires_at": expires_at,
+                "dedupe_key": dedupe_key,
+                "status": "pending",
+                "resolution": None,
+                "resolved_at": None,
+                "ts": datetime.now(timezone.utc),
+            }
+            return [{"id": ev_id}]
 
         if "EXPIRES_AT < NOW()" in sql_upper:
             now = datetime.now(timezone.utc)
@@ -143,7 +142,7 @@ async def test_dedup_blocks_second_enqueue_with_same_key():
     )
     # Second enqueue returns None (ON CONFLICT DO NOTHING) and no duplicate stored.
     assert id1 is not None
-    assert id2 is not None  # function still returns a UUID (it generated one before the conflict)
+    assert id2 is None
     rows = await list_events(db)
     assert len(rows) == 1
 
