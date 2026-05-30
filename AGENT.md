@@ -108,6 +108,11 @@ Creates all tables (idempotent — safe to run again). Includes:
 ```bash
 # In a persistent session (tmux, screen, pm2, systemd)
 bybit run
+
+# In a second window — watchdog that auto-restarts the service if it dies
+bybit watch                    # 90s checks, auto-restart on
+bybit watch --interval 60      # faster checks
+bybit watch --json             # machine-readable tick per line
 ```
 
 The service starts two cooperative asyncio tasks:

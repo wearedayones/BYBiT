@@ -80,6 +80,7 @@ The CLI is a **read + tune surface only** — it never places orders directly.
 | `bybit status [--json]` | Agent state: env, equity, drawdown, status, kill flag |
 | `bybit positions [--json]` | Open positions from the exchange |
 | `bybit report [--period daily\|weekly\|monthly] [--json]` | Performance digest |
+| `bybit watch [--interval N] [--no-restart] [--json]` | Watchdog: health-check every N sec, auto-restart if dead |
 | `bybit pause` | Set agent status = 'paused' (loop skips cycles) |
 | `bybit resume` | Set agent status = 'running' |
 | `bybit kill [--reason TEXT] [--force]` | Cancel all orders + flatten all positions + halt |

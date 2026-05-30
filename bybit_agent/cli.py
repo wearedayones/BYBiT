@@ -20,6 +20,7 @@ Commands:
   pause        Set agent status = 'paused'.
   resume       Set agent status = 'running'.
   kill         Engage the kill switch (cancel-all + flatten).
+  watch        Watchdog: health-check every N seconds, auto-restart if dead.
 """
 from __future__ import annotations
 
@@ -705,6 +706,154 @@ def kill(
         typer.echo("🔴 Kill switch engaged. All orders cancelled, all positions flattened.")
 
     asyncio.run(_run())
+
+
+# ── watch ─────────────────────────────────────────────────────────────────────
+
+@app.command()
+def watch(
+    interval: Annotated[int, typer.Option("--interval", help="Seconds between checks")] = 90,
+    restart: Annotated[bool, typer.Option("--restart/--no-restart", help="Auto-restart dead process")] = True,
+    as_json: Annotated[bool, typer.Option("--json", help="Emit one JSON object per tick")] = False,
+) -> None:
+    """Watchdog: health-check every N seconds, auto-restart if dead, emit structured status.
+
+    Any agent can run this to become the on-call doctor for the bot.
+    One output line per tick — tail it, pipe it, or read --json for automation.
+    Ctrl-C to stop.
+    """
+    import subprocess
+    from datetime import datetime, timezone
+
+    _LOG = Path("/tmp/bybit-run.log")
+    _bot_proc: list[subprocess.Popen] = [None]  # mutable cell so inner funcs can rebind
+
+    def _any_running() -> bool:
+        r = subprocess.run(["pgrep", "-f", "bybit run"], capture_output=True)
+        return r.returncode == 0
+
+    def _is_alive() -> bool:
+        p = _bot_proc[0]
+        if p is not None and p.poll() is None:
+            return True
+        return _any_running()
+
+    def _spawn() -> None:
+        _LOG.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(_LOG, "a")  # noqa: SIM115 — intentionally left open for subprocess lifetime
+        _bot_proc[0] = subprocess.Popen(["bybit", "run", "--testnet"], stdout=fh, stderr=fh)
+
+    async def _tick() -> dict:
+        from .events.queue import list_events
+
+        db = await _get_db()
+        try:
+            ag_rows   = await db.fetch("SELECT * FROM agent_state WHERE id = 'singleton' LIMIT 1")
+            snap_rows = await db.fetch(
+                "SELECT total_equity, drawdown_pct, open_positions, ts FROM equity_snapshots ORDER BY ts DESC LIMIT 1"
+            )
+            ev_rows   = await list_events(db, status="pending", limit=200)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+        ag   = ag_rows[0]   if ag_rows   else {}
+        snap = snap_rows[0] if snap_rows else {}
+        now  = datetime.now(timezone.utc)
+
+        cycle_age_s: int | None = None
+        last_at = ag.get("last_cycle_at")
+        if last_at:
+            try:
+                raw = str(last_at)
+                dt  = datetime.fromisoformat(raw) if "+" in raw else datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+                cycle_age_s = int((now - dt).total_seconds())
+            except Exception:
+                pass
+
+        return {
+            "ts":             now.strftime("%H:%M:%S"),
+            "env":            ag.get("env",    "unknown"),
+            "status":         ag.get("status", "unknown"),
+            "kill_engaged":   bool(ag.get("kill_engaged", False)),
+            "kill_reason":    ag.get("kill_reason"),
+            "equity":         round(float(snap.get("total_equity") or 0), 4),
+            "drawdown_pct":   round(float(snap.get("drawdown_pct") or 0) * 100, 3),
+            "open_positions": snap.get("open_positions", 0),
+            "promo_cycles":   ag.get("promotion_cycle_count", 0),
+            "events_pending": len(ev_rows),
+            "cycle_age_s":    cycle_age_s,
+            "last_cycle_at":  str(last_at or ""),
+        }
+
+    async def _loop() -> None:
+        typer.echo("bybit watch — press Ctrl-C to stop\n")
+        prev_promo = 0
+        prev_cycle = ""
+
+        while True:
+            t0 = asyncio.get_event_loop().time()
+
+            # 1. Liveness + optional restart
+            alive  = _is_alive()
+            restarted = False
+            if not alive and restart:
+                _spawn()
+                restarted = True
+                await asyncio.sleep(3)  # brief settle before DB read
+
+            # 2. DB tick
+            try:
+                d = await _tick()
+            except Exception as exc:
+                msg = {"ts": datetime.now().strftime("%H:%M:%S"), "error": str(exc)}
+                typer.echo(json.dumps(msg) if as_json else f"[{msg['ts']}] ERROR — {exc}")
+                await asyncio.sleep(interval)
+                continue
+
+            # 3. Flags
+            flags: list[str] = []
+            if restarted:                                    flags.append("RESTARTED")
+            if not alive and not restart:                    flags.append("DEAD")
+            if d["kill_engaged"]:                            flags.append(f"KILL({d['kill_reason']})")
+            if d["cycle_age_s"] is not None and d["cycle_age_s"] > 180:
+                                                             flags.append(f"STALE({d['cycle_age_s']}s)")
+            if d["drawdown_pct"] > 0:                        flags.append(f"DD={d['drawdown_pct']}%")
+            if d["events_pending"] > 0:                      flags.append(f"EVENTS={d['events_pending']}")
+            if d["last_cycle_at"] != prev_cycle:             flags.append("NEW_CYCLE")
+            if d["promo_cycles"] > prev_promo:               flags.append(f"PROMO={d['promo_cycles']}")
+
+            prev_cycle = d["last_cycle_at"]
+            prev_promo = d["promo_cycles"]
+            d["flags"]         = flags
+            d["process_alive"] = _is_alive()
+
+            # 4. Stale+dead auto-restart
+            if "STALE" in " ".join(flags) and not d["process_alive"] and restart:
+                typer.echo(f"[{d['ts']}]  STALE+DEAD — restarting...")
+                _spawn()
+
+            # 5. Emit
+            if as_json:
+                typer.echo(json.dumps(d, default=str))
+            else:
+                flag_str = "  ".join(flags)
+                typer.echo(
+                    f"[{d['ts']}]  {d['env']}/{d['status']}"
+                    f"  eq=${d['equity']:.4f}"
+                    f"  pos={d['open_positions']}"
+                    f"  promo={d['promo_cycles']}"
+                    f"  age={d['cycle_age_s']}s"
+                    + (f"  {flag_str}" if flag_str else "")
+                )
+
+            elapsed = asyncio.get_event_loop().time() - t0
+            await asyncio.sleep(max(0.0, interval - elapsed))
+
+    try:
+        asyncio.run(_loop())
+    except KeyboardInterrupt:
+        typer.echo("\nbybit watch stopped.")
 
 
 if __name__ == "__main__":
