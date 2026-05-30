@@ -48,6 +48,10 @@ class DecisionEngine:
         self._strategies = [TrendMomentum(), MeanReversion(), Breakout(), FundingHarvest()]
         self._paper = paper
 
+    @property
+    def paper(self) -> bool:
+        return self._paper
+
     async def run(self, snapshots, cycle_id: str) -> list[WeightedSignal]:
         db = get_db()
         rows = await db.fetch("SELECT strategy, weight, enabled FROM strategy_weights")

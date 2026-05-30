@@ -90,3 +90,7 @@ def child_logger(**bindings: Any) -> structlog.stdlib.BoundLogger:
 
 configure_logging()
 logger = structlog.get_logger()
+
+# Convenience alias — `get_logger()` returns a root bound logger; callers
+# typically chain `.bind(module=…)` immediately after.
+get_logger = structlog.get_logger
