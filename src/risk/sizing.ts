@@ -12,6 +12,13 @@ export interface SizingInput {
   qtyStep: number;
   maxQty: number;
   maxExposurePct?: number;
+  /**
+   * Hard ceiling on a single min-lot trade's stop-loss risk, as a fraction of
+   * equity. When the risk-budget sizing rounds below the exchange minimum, we
+   * still take the trade if min-lot risk stays under this cap. Scales with any
+   * balance, so a $10 and a $10k account both "know what to do". Default 0.10.
+   */
+  maxAbsoluteRiskPct?: number;
 }
 
 export interface SizingResult {
@@ -64,13 +71,15 @@ export function computePositionSize(input: SizingInput): SizingResult {
   qty = qty.div(qtyStep).floor().mul(qtyStep);
 
   // Min-lot rounding: when risk-based qty falls below the exchange minimum,
-  // round up to minQty only if the resulting stop-loss risk stays within 5× the
-  // risk budget. This allows small accounts to enter instruments where the min-lot
-  // risk is modestly above the target (e.g., ETH on a $100 account) while still
-  // blocking instruments where it would be dangerously outsized (e.g., BTC).
+  // round up to minQty only if the resulting stop-loss risk stays within an
+  // absolute fraction of equity (default 10%). This scales with any balance —
+  // a $10 account trading a cheap coin and a $10k account trading ETH both
+  // clear the same proportional bar — while still blocking instruments whose
+  // min-lot would risk a dangerous chunk of the account in one trade.
+  const maxAbsoluteRiskPct = new Decimal(input.maxAbsoluteRiskPct ?? 0.10);
   if (qty.lt(minQty)) {
     const minLotRisk = minQty.mul(riskPerUnit);
-    if (minLotRisk.lte(riskBudget.mul(5))) {
+    if (minLotRisk.lte(equity.mul(maxAbsoluteRiskPct))) {
       qty = minQty;
     } else {
       return { qty: 0, riskAmount: 0, notional: 0, riskPct: 0 };

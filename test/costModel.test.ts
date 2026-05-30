@@ -22,10 +22,13 @@ describe('CostModel', () => {
     expect(c).toBeCloseTo(expected, 10);
   });
 
-  it('treats an unknown prior (1.0) as a neutral coin flip', () => {
+  it('treats an unknown prior (1.0) as a slight positive bias (0.55)', () => {
+    // A directional signal that cleared the strategy + regime filters is not a
+    // pure coin flip; with no learned history we assume a small edge so the
+    // system can bootstrap trades before win-rates accumulate.
     const cost = roundTripCostPct('linear', true, false);
     const r = expectedValue(sig(100, 99, 103), 1.0, cost)!;
-    expect(r.winProb).toBe(0.5);
+    expect(r.winProb).toBe(0.55);
   });
 
   it('positive EV for a high reward:risk trade', () => {
@@ -35,9 +38,9 @@ describe('CostModel', () => {
     expect(r.ev).toBeGreaterThan(0);
   });
 
-  it('negative EV once costs eat a thin edge', () => {
+  it('negative EV when reward:risk is poor and costs eat the edge', () => {
     const cost = roundTripCostPct('linear', true, false);
-    const r = expectedValue(sig(100, 99, 101.3), 1.0, cost)!; // R:R = 1.3, coin flip
+    const r = expectedValue(sig(100, 99, 100.5), 1.0, cost)!; // R:R = 0.5, win < loss
     expect(r.ev).toBeLessThan(0);
   });
 

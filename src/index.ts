@@ -1,5 +1,5 @@
 import './config/env';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { loadSkill } from './skill/skillLoader';
 import { checkAndUpdateSkill } from './skill/skillUpdater';
@@ -24,10 +24,13 @@ async function main() {
   // ── 3. Run migrations ─────────────────────────────────────────────────────
   logger.info('Running database migrations…');
   const sql = getDb();
-  const migrationPath = join(process.cwd(), 'migrations', '0001_init.sql');
-  if (existsSync(migrationPath)) {
-    await sql.unsafe(readFileSync(migrationPath, 'utf8'));
-    logger.info('✅ Migrations complete');
+  const migrationsDir = join(process.cwd(), 'migrations');
+  if (existsSync(migrationsDir)) {
+    const files = readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
+    for (const f of files) {
+      await sql.unsafe(readFileSync(join(migrationsDir, f), 'utf8'));
+    }
+    logger.info({ files: files.length }, '✅ Migrations complete');
   }
 
   // ── 4. Verify clock sync (skill rule: halt if >5s off) ───────────────────

@@ -38,8 +38,11 @@ describe('RiskManager expectancy gate', () => {
     expect(r.reason).toMatch(/reward:risk/i);
   });
 
-  it('rejects a thin-edge trade with negative expected value', () => {
-    const r = rm.approve(signal(100, 99, 101.3), instrument, false); // R:R 1.3, coin flip
+  it('rejects a trade that clears reward:risk but has negative EV from a poor learned prior', () => {
+    // R:R 1.3 passes the R:R floor, but a learned win-rate of 0.3 in this
+    // strategy+regime makes the expected value negative once costs are paid.
+    const sig = { ...signal(100, 99, 101.3), learnedPrior: 0.3 };
+    const r = rm.approve(sig, instrument, false);
     expect(r.approved).toBe(false);
     expect(r.reason).toMatch(/expected value/i);
   });

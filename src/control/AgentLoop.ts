@@ -3,6 +3,7 @@ import { childLogger } from '../core/logger';
 import { getDb } from '../persistence/db';
 import { BybitClient } from '../exchange/BybitClient';
 import { MarketDataService } from '../market/MarketDataService';
+import { MarketDiscovery } from '../market/MarketDiscovery';
 import { DecisionEngine } from '../strategy/DecisionEngine';
 import { RiskManager } from '../risk/RiskManager';
 import { PortfolioManager } from '../portfolio/PortfolioManager';
@@ -22,7 +23,10 @@ import type { WeightedSignal } from '../strategy/DecisionEngine';
 
 const log = childLogger({ module: 'agent-loop' });
 
-const WATCHED_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+// Seed list used only until the first market-discovery pass populates the
+// balance-aware watch list; after that the agent picks its own universe.
+const FALLBACK_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+const DISCOVERY_INTERVAL_MS = 30 * 60 * 1000; // re-survey the market every 30 min
 
 export class AgentLoop {
   private running = false;
@@ -30,8 +34,11 @@ export class AgentLoop {
   private lastWeeklyReport = 0;
   private lastMonthlyReport = 0;
   private lastRepoCheck = 0;
+  private lastDiscovery = 0;
+  private watchedSymbols: string[] = [...FALLBACK_SYMBOLS];
 
   private readonly market: MarketDataService;
+  private readonly discovery: MarketDiscovery;
   private readonly decisions: DecisionEngine;
   private readonly riskManager: RiskManager;
   private readonly portfolio: PortfolioManager;
@@ -45,6 +52,7 @@ export class AgentLoop {
 
   constructor(private readonly client: BybitClient, private readonly isTestnet: boolean) {
     this.market = new MarketDataService(client);
+    this.discovery = new MarketDiscovery(client);
     this.decisions = new DecisionEngine();
     this.portfolio = new PortfolioManager(client);
     this.riskManager = new RiskManager(() => this.portfolio.getState());
@@ -104,9 +112,20 @@ export class AgentLoop {
       return;
     }
 
+    // ── 2b. Market discovery ─────────────────────────────────────
+    // Periodically re-survey the exchange and rebuild the watch list around
+    // what this balance can actually trade. The agent owns its own universe.
+    const now0 = Date.now();
+    if (now0 - this.lastDiscovery > DISCOVERY_INTERVAL_MS) {
+      this.lastDiscovery = now0;
+      const equity = this.portfolio.getState().equity;
+      const symbols = await this.discovery.discover(equity).catch(() => null);
+      if (symbols && symbols.length > 0) this.watchedSymbols = symbols;
+    }
+
     // ── 3. Market snapshots ──────────────────────────────────────
     const snapshots = await Promise.all(
-      WATCHED_SYMBOLS.map(s => this.market.getSnapshot(s, 'linear').catch(() => null))
+      this.watchedSymbols.map(s => this.market.getSnapshot(s, 'linear').catch(() => null))
     ).then(r => r.filter(Boolean) as Awaited<ReturnType<MarketDataService['getSnapshot']>>[]);
 
     if (snapshots.length === 0) { cyclelog.warn('No market data — skipping cycle'); return; }

@@ -6,11 +6,23 @@ import type { PortfolioState } from '../risk/RiskManager';
 
 const log = childLogger({ module: 'bot-manager' });
 
+// Bybit enforces a per-symbol minimum grid investment; we attempt only above
+// this floor and let validateSpotGrid be the final gate. Nothing is scaled
+// down artificially — the agent tries with whatever the balance allows.
+const MIN_GRID_INVESTMENT_USDT = 10;
+
 export class BotManager {
+  // is_paper tags rows by environment (testnet vs mainnet) for reporting only.
+  // Execution is always real against whichever exchange the client points at —
+  // on testnet that's the Bybit testnet grid-bot API, not a local simulation.
+  private readonly isTestnet: boolean;
+
   constructor(
     private readonly client: BybitClient,
-    private readonly isPaper: boolean,
-  ) {}
+    isTestnet: boolean,
+  ) {
+    this.isTestnet = isTestnet;
+  }
 
   async tick(snapshots: MarketSnapshot[], portfolio: PortfolioState): Promise<void> {
     await this.monitorActiveBots();
@@ -19,16 +31,10 @@ export class BotManager {
 
   private async monitorActiveBots(): Promise<void> {
     const sql = getDb();
-    const bots = await sql`SELECT * FROM bot_instances WHERE status = 'active' AND is_paper = ${this.isPaper}`;
+    const bots = await sql`SELECT * FROM bot_instances WHERE status = 'active' AND is_paper = ${this.isTestnet}`;
 
     for (const bot of bots) {
       try {
-        if (this.isPaper) {
-          // Paper mode: update virtual state
-          await sql`UPDATE bot_instances SET updated_at = now() WHERE id = ${bot.id}`;
-          continue;
-        }
-
         let detail: Record<string, unknown> | null = null;
         if (bot.bot_type === 'spot_grid' && bot.exchange_bot_id) {
           detail = await this.client.getSpotGridDetail(bot.exchange_bot_id) as Record<string, unknown>;
@@ -65,7 +71,7 @@ export class BotManager {
       if (existing.length > 0) continue;
 
       const investment = portfolio.equity * 0.05; // 5% equity per bot
-      if (investment < 100) continue;
+      if (investment < MIN_GRID_INVESTMENT_USDT) continue;
 
       try {
         await this.createGridBot(snap, investment);
@@ -88,16 +94,8 @@ export class BotManager {
       cellNumber, totalInvestment: investment,
     };
 
-    if (this.isPaper) {
-      await sql`
-        INSERT INTO bot_instances (bot_type, symbol, category, status, config, state, is_paper)
-        VALUES ('spot_grid', ${snap.symbol}, 'spot', 'active', ${JSON.stringify(config)}::jsonb, '{}'::jsonb, true)
-      `;
-      log.info({ symbol: snap.symbol }, '[PAPER] Created spot grid bot');
-      return;
-    }
-
-    // Validate first (skill rule)
+    // Validate first (skill rule), then create on the real exchange the client
+    // is pointed at (testnet or mainnet). is_paper tags the row by environment.
     await this.client.validateSpotGrid({
       symbol: snap.symbol,
       min_price: String(minPrice),
@@ -117,15 +115,14 @@ export class BotManager {
     await sql`
       INSERT INTO bot_instances (bot_type, exchange_bot_id, symbol, category, status, config, state, is_paper)
       VALUES ('spot_grid', ${result.grid_id}, ${snap.symbol}, 'spot', 'active',
-        ${JSON.stringify(config)}::jsonb, '{}'::jsonb, false)
+        ${JSON.stringify(config)}::jsonb, '{}'::jsonb, ${this.isTestnet})
     `;
-    log.info({ symbol: snap.symbol, gridId: result.grid_id }, 'Created spot grid bot');
+    log.info({ symbol: snap.symbol, gridId: result.grid_id, testnet: this.isTestnet }, 'Created spot grid bot');
   }
 
   async stopAll(): Promise<void> {
-    if (this.isPaper) return;
     const sql = getDb();
-    const bots = await sql`SELECT * FROM bot_instances WHERE status = 'active' AND is_paper = false`;
+    const bots = await sql`SELECT * FROM bot_instances WHERE status = 'active' AND is_paper = ${this.isTestnet}`;
     for (const bot of bots) {
       try {
         if (bot.bot_type === 'spot_grid') {

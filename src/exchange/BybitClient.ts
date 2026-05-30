@@ -53,6 +53,12 @@ export class BybitClient {
     return res.list[0] ?? null;
   }
 
+  /** All tickers for a category in one call — used by market discovery to rank the universe. */
+  async getTickers(category: Category): Promise<Ticker[]> {
+    const res = await this.publicGet<{ list: Ticker[] }>(`/v5/market/tickers?category=${category}`);
+    return res.list ?? [];
+  }
+
   async getOrderbook(category: Category, symbol: string, limit = 50): Promise<Orderbook> {
     // Bybit returns {s, b: [["price","size"],...], a: [...]} — normalize to typed shape.
     const raw = await this.publicGet<{ s: string; b: string[][]; a: string[][]; ts: number; seq: number }>(
@@ -73,9 +79,24 @@ export class BybitClient {
   }
 
   async getInstrumentsInfo(category: Category, symbol?: string): Promise<InstrumentInfo[]> {
-    const qs = symbol ? `?category=${category}&symbol=${symbol}` : `?category=${category}&limit=500`;
-    const res = await this.publicGet<{ list: InstrumentInfo[] }>(`/v5/market/instruments-info${qs}`);
-    return res.list;
+    if (symbol) {
+      const res = await this.publicGet<{ list: InstrumentInfo[] }>(`/v5/market/instruments-info?category=${category}&symbol=${symbol}`);
+      return res.list;
+    }
+    // No symbol → page through the full universe via cursor (one page is capped
+    // at 1000, but the exchange may hold more linear perps than that).
+    const all: InstrumentInfo[] = [];
+    let cursor = '';
+    for (let page = 0; page < 10; page++) {
+      const cur = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+      const res = await this.publicGet<{ list: InstrumentInfo[]; nextPageCursor?: string }>(
+        `/v5/market/instruments-info?category=${category}&limit=1000${cur}`,
+      );
+      all.push(...res.list);
+      if (!res.nextPageCursor || res.list.length === 0) break;
+      cursor = res.nextPageCursor;
+    }
+    return all;
   }
 
   // ─── Private (authenticated) ─────────────────────────────────────────────────
