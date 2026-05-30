@@ -26,6 +26,7 @@ const schema = z.object({
   //   BYBIT_API_PRIVATE_KEY_PATH → RSA-SHA256  (self-generated/AI sub-account key)
   BYBIT_API_SECRET: z.string().optional(),
   BYBIT_API_PRIVATE_KEY_PATH: z.string().optional(),
+  BYBIT_API_PRIVATE_KEY: z.string().optional(),  // inline PEM (alternative to path)
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid connection URL'),
   REPORT_EMAIL: z.string().email().optional(),
   REPORT_EMAIL_APP_PASSWORD: z.string().optional(),
@@ -34,7 +35,7 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   LOG_LEVEL: z.string().default('info'),
 }).refine(
-  (e) => !!e.BYBIT_API_SECRET || !!e.BYBIT_API_PRIVATE_KEY_PATH,
+  (e) => !!e.BYBIT_API_SECRET || !!e.BYBIT_API_PRIVATE_KEY_PATH || !!e.BYBIT_API_PRIVATE_KEY,
   { message: 'Set BYBIT_API_SECRET (HMAC) or BYBIT_API_PRIVATE_KEY_PATH (RSA)', path: ['BYBIT_API_SECRET'] },
 );
 

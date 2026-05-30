@@ -19,8 +19,9 @@ export function resolveBybitAuth(env: {
   BYBIT_API_KEY: string;
   BYBIT_API_SECRET?: string;
   BYBIT_API_PRIVATE_KEY_PATH?: string;
+  BYBIT_API_PRIVATE_KEY?: string;   // inline PEM (alternative to file path)
 }): BybitAuth {
-  const hasRsa = !!env.BYBIT_API_PRIVATE_KEY_PATH;
+  const hasRsa = !!env.BYBIT_API_PRIVATE_KEY_PATH || !!env.BYBIT_API_PRIVATE_KEY;
   const hasHmac = !!env.BYBIT_API_SECRET;
 
   if (hasRsa && hasHmac) {
@@ -31,17 +32,23 @@ export function resolveBybitAuth(env: {
   }
 
   if (hasRsa) {
-    const path = env.BYBIT_API_PRIVATE_KEY_PATH!;
     let privateKey: string;
-    try {
-      privateKey = readFileSync(path, 'utf8');
-    } catch {
-      throw new Error(`Could not read RSA private key at BYBIT_API_PRIVATE_KEY_PATH (${basename(path)})`);
+    if (env.BYBIT_API_PRIVATE_KEY) {
+      // Inline PEM — replace literal \n with real newlines (common when set via env var)
+      privateKey = env.BYBIT_API_PRIVATE_KEY.replace(/\\n/g, '\n');
+      log.info({ signing: 'RSA-SHA256', keySource: 'env-var' }, 'Bybit auth: RSA (inline key)');
+    } else {
+      const path = env.BYBIT_API_PRIVATE_KEY_PATH!;
+      try {
+        privateKey = readFileSync(path, 'utf8');
+      } catch {
+        throw new Error(`Could not read RSA private key at BYBIT_API_PRIVATE_KEY_PATH (${basename(path)})`);
+      }
+      log.info({ signing: 'RSA-SHA256', keyFile: basename(path) }, 'Bybit auth: RSA (file)');
     }
     if (!privateKey.includes('PRIVATE KEY')) {
-      throw new Error(`File at BYBIT_API_PRIVATE_KEY_PATH (${basename(path)}) is not a PEM private key`);
+      throw new Error('BYBIT_API_PRIVATE_KEY / BYBIT_API_PRIVATE_KEY_PATH does not contain a PEM private key');
     }
-    log.info({ signing: 'RSA-SHA256', keyFile: basename(path) }, 'Bybit auth: RSA');
     return { apiKey: env.BYBIT_API_KEY, signType: 2, privateKey };
   }
 

@@ -4,3 +4,4 @@ dist/
 logs/
 *.log
 .DS_Store
+keys/
