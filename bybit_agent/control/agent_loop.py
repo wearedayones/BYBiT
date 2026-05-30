@@ -27,6 +27,9 @@ from bybit_agent.execution.execution_router import ExecutionRouter, EnterParams
 from bybit_agent.control.kill_switch import KillSwitch
 from bybit_agent.control.promotion import PromotionManager
 from bybit_agent.persistence.db import NeonHttpClient
+from bybit_agent.review.self_review import SelfReview
+from bybit_agent.bots.bot_manager import BotManager
+from bybit_agent.copy.copy_manager import CopyTradingManager
 
 log = get_logger().bind(module="agent-loop")
 
@@ -50,6 +53,9 @@ class AgentLoop:
         self._execution = ExecutionRouter(client, is_sim=False)
         self._kill = KillSwitch(client, db)
         self._promotion = PromotionManager(db)
+        self._review = SelfReview()
+        self._bots = BotManager(client, db, is_testnet)
+        self._copy = CopyTradingManager(client, db, is_paper=is_testnet)
 
         self._last_daily_report = 0.0
         self._last_weekly_report = 0.0
@@ -237,8 +243,24 @@ class AgentLoop:
                         cycle_id, sig["symbol"], sig["strategy"],
                     )
 
-        # ── 6. Self-review (Phase 5 will add full implementation) ──────────
-        # Stub: SelfReview.tick() will be wired in Phase 5.
+        # ── 6. Bot tick ─────────────────────────────────────────────────────
+        if not daily_limit_hit and not self._kill.is_engaged():
+            try:
+                await self._bots.tick(snapshots, self._portfolio.get_state())
+            except Exception as e:
+                log.error("Bot tick error", error=str(e))
+
+        # ── 6b. Copy trading tick ────────────────────────────────────────────
+        try:
+            await self._copy.tick(self._portfolio.get_state())
+        except Exception as e:
+            log.error("Copy tick error", error=str(e))
+
+        # ── 6c. Self-review ──────────────────────────────────────────────────
+        try:
+            await self._review.tick(cycle_id, self._db)
+        except Exception as e:
+            log.error("Self-review error", error=str(e))
 
         # ── 7. Promotion check ──────────────────────────────────────────────
         if is_testnet:
@@ -302,7 +324,7 @@ class AgentLoop:
             from bybit_agent.reports.report_builder import build_and_send_report
             await build_and_send_report(period)
         except Exception as e:
-            log.error(f"{period} report failed", error=str(e))
+            log.error("Report failed", period=period, error=str(e))
 
     async def _repo_check(self) -> None:
         try:
