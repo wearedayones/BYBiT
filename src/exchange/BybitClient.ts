@@ -54,7 +54,17 @@ export class BybitClient {
   }
 
   async getOrderbook(category: Category, symbol: string, limit = 50): Promise<Orderbook> {
-    return this.publicGet<Orderbook>(`/v5/market/orderbook?category=${category}&symbol=${symbol}&limit=${limit}`);
+    // Bybit returns {s, b: [["price","size"],...], a: [...]} — normalize to typed shape.
+    const raw = await this.publicGet<{ s: string; b: string[][]; a: string[][]; ts: number; seq: number }>(
+      `/v5/market/orderbook?category=${category}&symbol=${symbol}&limit=${limit}`,
+    );
+    return {
+      symbol: raw.s,
+      bids: (raw.b ?? []).map(([price, size]) => ({ price, size })),
+      asks: (raw.a ?? []).map(([price, size]) => ({ price, size })),
+      ts: raw.ts,
+      seq: raw.seq,
+    };
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<FundingRateItem[]> {
@@ -215,8 +225,25 @@ export class BybitClient {
 
   // ─── Internal helpers ─────────────────────────────────────────────────────────
 
+  // Retry up to 3× on CERT_NOT_YET_VALID (TLS inspection proxy clock skew).
+  private async tlsRetry<T>(fn: () => Promise<T>): Promise<T> {
+    for (let i = 0; i < 3; i++) {
+      try {
+        return await fn();
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code ?? (err as { cause?: { code?: string } })?.cause?.code;
+        if (code === 'CERT_NOT_YET_VALID' && i < 2) {
+          await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error('unreachable');
+  }
+
   private async publicGet<T>(path: string): Promise<T> {
-    return rateLimiter.scheduleGet(async () => {
+    return this.tlsRetry(() => rateLimiter.scheduleGet(async () => {
       const url = `${this.baseUrl}${path}`;
       log.debug({ url }, 'GET');
       const res = await request(url, {
@@ -229,11 +256,11 @@ export class BybitClient {
         throw new BybitApiError(body.retCode, body.retMsg, path);
       }
       return body.result;
-    });
+    }));
   }
 
   private async privateGet<T>(pathWithQs: string): Promise<T> {
-    return rateLimiter.scheduleGet(async () => {
+    return this.tlsRetry(() => rateLimiter.scheduleGet(async () => {
       const ts = Date.now();
       const qsStart = pathWithQs.indexOf('?');
       const basePath = qsStart >= 0 ? pathWithQs.slice(0, qsStart) : pathWithQs;
@@ -251,11 +278,11 @@ export class BybitClient {
         throw err;
       }
       return body.result;
-    });
+    }));
   }
 
   private async privatePost<T>(path: string, payload: Record<string, unknown>): Promise<T> {
-    return rateLimiter.schedulePost(async () => {
+    return this.tlsRetry(() => rateLimiter.schedulePost(async () => {
       const ts = Date.now();
       const jsonBody = JSON.stringify(payload);
       const paramStr = buildPostParamStr(ts, this.apiKey, jsonBody);
@@ -271,11 +298,11 @@ export class BybitClient {
         throw err;
       }
       return body.result;
-    });
+    }));
   }
 
   private async botPost<T>(path: string, payload: Record<string, unknown>): Promise<T> {
-    return rateLimiter.schedulePost(async () => {
+    return this.tlsRetry(() => rateLimiter.schedulePost(async () => {
       const ts = Date.now();
       const jsonBody = JSON.stringify(payload);
       const paramStr = buildPostParamStr(ts, this.apiKey, jsonBody);
@@ -295,6 +322,6 @@ export class BybitClient {
         throw new BotApiError(body.status_code, body.debug_msg, path);
       }
       return body.result;
-    });
+    }));
   }
 }

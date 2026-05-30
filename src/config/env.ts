@@ -14,7 +14,7 @@ function loadEnvFile() {
     if (eqIdx < 0) continue;
     const key = trimmed.slice(0, eqIdx).trim();
     const value = trimmed.slice(eqIdx + 1).trim();
-    if (!(key in process.env)) process.env[key] = value;
+    process.env[key] = value; // .env always wins over stale shell exports
   }
 }
 loadEnvFile();

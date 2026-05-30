@@ -24,6 +24,24 @@ export interface SqlClient {
 
 let _client: SqlClient | null = null;
 
+// Retry up to 3× on CERT_NOT_YET_VALID (TLS inspection proxy clock skew).
+async function tlsRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const e = err as { code?: string; sourceError?: { cause?: { code?: string } } };
+      const code = e?.code ?? e?.sourceError?.cause?.code;
+      if (code === 'CERT_NOT_YET_VALID' && i < 2) {
+        await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('unreachable');
+}
+
 export function getDb(): SqlClient {
   if (!_client) {
     const neonFn = neon(env.DATABASE_URL);
@@ -62,14 +80,14 @@ export function getDb(): SqlClient {
       });
 
       // Use neonFn with a pre-built parameterized query string.
-      return neonFn.query(query, params as string[]) as Promise<Row[]>;
+      return tlsRetry(() => neonFn.query(query, params as string[]) as Promise<Row[]>);
     };
 
     // For the migration SQL file: split on semicolons and run each statement.
     sql.unsafe = async (rawSql: string): Promise<void> => {
       const stmts = rawSql.split(';').map(s => s.trim()).filter(s => s.length > 0);
       for (const stmt of stmts) {
-        await neonFn.query(stmt, []);
+        await tlsRetry(() => neonFn.query(stmt, []));
       }
     };
 
