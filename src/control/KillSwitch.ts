@@ -2,6 +2,7 @@ import { BybitClient } from '../exchange/BybitClient';
 import { getDb } from '../persistence/db';
 import { childLogger } from '../core/logger';
 import { KillSwitchError } from '../core/errors';
+import { sendTelegram } from '../reports/telegram';
 
 const log = childLogger({ module: 'kill-switch' });
 
@@ -16,6 +17,10 @@ export class KillSwitch {
     if (this.engaged) return;
     this.engaged = true;
     log.fatal({ reason }, '🔴 KILL SWITCH ENGAGED');
+
+    // Best-effort critical alert (never let a notification failure block the kill).
+    sendTelegram(`🔴 <b>KILL SWITCH ENGAGED</b>\nReason: ${reason}\nFlattening all positions and cancelling orders.`)
+      .catch(() => {});
 
     const sql = getDb();
     try {

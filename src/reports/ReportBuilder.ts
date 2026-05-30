@@ -1,5 +1,6 @@
 import { getDb } from '../persistence/db';
 import { sendReport } from './emailer';
+import { sendTelegram, telegramEnabled } from './telegram';
 import { childLogger } from '../core/logger';
 
 const log = childLogger({ module: 'report-builder' });
@@ -84,6 +85,27 @@ export async function buildAndSendReport(period: 'daily' | 'weekly' | 'monthly')
 
     const subject = `[BYBiT Agent] ${capitalize(period)} Report — ${now.toDateString()} | PnL: $${totalPnl.toFixed(2)}`;
     await sendReport(subject, html, period);
+
+    // Telegram delivery (concise text summary — works in restricted environments).
+    if (telegramEnabled()) {
+      const lines = [
+        `📊 <b>${capitalize(period)} Report</b> — ${now.toDateString()}`,
+        `💰 PnL: <b>$${totalPnl.toFixed(2)}</b>`,
+        `📈 Equity: $${latestEquity.toFixed(2)}`,
+        `📉 Max DD: ${(maxDD * 100).toFixed(2)}%`,
+      ];
+      if (trades.length) {
+        lines.push('', '<b>Strategies</b>');
+        for (const t of trades.slice(0, 8)) {
+          const pnl = parseFloat(t.pnl ?? '0');
+          lines.push(`• ${t.strategy}: $${pnl.toFixed(2)} (${t.wins ?? 0}/${t.count ?? 0})`);
+        }
+      }
+      if (riskEvents.length) {
+        lines.push('', `⚠️ Risk: ${riskEvents.map(r => `${r.type}×${r.count}`).join(', ')}`);
+      }
+      await sendTelegram(lines.join('\n'));
+    }
   } catch (e) {
     log.error({ e }, 'Report build failed');
   }

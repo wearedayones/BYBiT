@@ -30,6 +30,9 @@ const schema = z.object({
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid connection URL'),
   REPORT_EMAIL: z.string().email().optional(),
   REPORT_EMAIL_APP_PASSWORD: z.string().optional(),
+  // Telegram notifications — works over HTTPS (443), ideal for cloud/restricted hosts.
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
+  TELEGRAM_CHAT_ID: z.string().optional(),
   BYBIT_PROXY_URL: z.string().url().optional(),
   GITHUB_TOKEN: z.string().optional(),
   NEWS_API_KEY: z.string().optional(),
