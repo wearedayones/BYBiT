@@ -3,8 +3,9 @@ export const RECV_WINDOW = 5000;
 export const USER_AGENT = `bybit-skill/${SKILL_VERSION}`;
 export const X_REFERER = 'bybit-skill';
 
-export const MAINNET_REST = 'https://api.bybit.com';
-export const TESTNET_REST = 'https://api-testnet.bybit.com';
+const _proxy = process.env['BYBIT_PROXY_URL'] ?? '';
+export const MAINNET_REST = _proxy ? `${_proxy}/mainnet` : 'https://api.bybit.com';
+export const TESTNET_REST = _proxy ? `${_proxy}/testnet` : 'https://api-testnet.bybit.com';
 export const MAINNET_WS_PUBLIC = 'wss://stream.bybit.com/v5/public';
 export const MAINNET_WS_PRIVATE = 'wss://stream.bybit.com/v5/private';
 export const TESTNET_WS_PRIVATE = 'wss://stream-testnet.bybit.com/v5/private';
