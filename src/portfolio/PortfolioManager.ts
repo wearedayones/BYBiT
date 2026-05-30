@@ -12,10 +12,14 @@ export class PortfolioManager {
     dailyLossLimit: 0.08, killLevelPct: 0.20,
     circuitBreakerPct: 0.10, maxRiskPct: 0.015,
   };
+  private openSymbols: Set<string> = new Set();
 
   constructor(private readonly client: BybitClient) {}
 
   getState(): PortfolioState { return { ...this.state }; }
+
+  /** Symbols that currently have a non-zero position on the exchange. */
+  hasOpenPosition(symbol: string): boolean { return this.openSymbols.has(symbol); }
 
   async refresh(): Promise<PortfolioState> {
     try {
@@ -28,7 +32,9 @@ export class PortfolioManager {
       const ag = agentRow[0];
       const equity = parseFloat(wallet?.totalEquity ?? '0');
       const unrealizedPnl = parseFloat(wallet?.totalPerpUPL ?? '0');
-      const openPositionCount = positions.filter(p => parseFloat(p.size) > 0).length;
+      const openPos = positions.filter(p => parseFloat(p.size) > 0);
+      const openPositionCount = openPos.length;
+      this.openSymbols = new Set(openPos.map(p => p.symbol));
 
       const today = new Date().toISOString().slice(0, 10);
       const tradingDay = ag?.trading_day ? new Date(ag.trading_day).toISOString().slice(0, 10) : '';

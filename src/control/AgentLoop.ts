@@ -124,6 +124,14 @@ export class AgentLoop {
     // ── 5. Execute signals ──────────────────────────────────────
     for (const sig of signals) {
       if (this.killSwitch.isEngaged()) break;
+
+      // Let the agent manage existing positions via PositionHealthManager.
+      // Don't stack entries on top of an already-open position for the same symbol.
+      if (this.portfolio.hasOpenPosition(sig.symbol)) {
+        cyclelog.debug({ symbol: sig.symbol }, 'Skipping entry — position already open');
+        continue;
+      }
+
       const snap = snapshots.find(s => s.symbol === sig.symbol);
       if (!snap) continue;
 
