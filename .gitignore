@@ -6,3 +6,11 @@ logs/
 .DS_Store
 keys/
 .claude/settings.local.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
