@@ -1,15 +1,11 @@
-import { Pool, neonConfig } from '@neondatabase/serverless';
-import ws from 'ws';
+import { neon } from '@neondatabase/serverless';
 import { env } from '../config/env';
 import { childLogger } from '../core/logger';
 
 const log = childLogger({ module: 'db' });
 
-// Route through WebSocket on port 443 — bypasses the TCP 5432 firewall restriction.
-neonConfig.webSocketConstructor = ws;
+// neon() uses Neon's HTTP API on port 443 — bypasses the blocked TCP 5432/6543.
 
-// Marker class so the template builder can add ::jsonb casts automatically,
-// matching the behaviour of postgres.js sql.json().
 class JsonbValue {
   constructor(readonly data: unknown) {}
 }
@@ -17,10 +13,8 @@ class JsonbValue {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Row = Record<string, any>;
 
-// Minimal postgres.js-compatible interface used across the codebase.
 export interface SqlClient {
-  // Generic overload lets callers write sql<MyType>`...` like postgres.js — T is unused
-  // at runtime but silences the TS2558 errors across the codebase.
+  // Generic overload so sql<MyType>`...` compiles (T unused at runtime).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   <T = Row>(strings: TemplateStringsArray, ...values: any[]): Promise<Row[]>;
   unsafe(rawSql: string): Promise<void>;
@@ -28,58 +22,65 @@ export interface SqlClient {
   json(value: any): JsonbValue;
 }
 
-let _pool: Pool | null = null;
 let _client: SqlClient | null = null;
-
-function buildClient(pool: Pool): SqlClient {
-  const sql = (strings: TemplateStringsArray, ...values: unknown[]): Promise<Row[]> => {
-    let query = '';
-    const params: unknown[] = [];
-    strings.forEach((str, i) => {
-      query += str;
-      if (i < values.length) {
-        const v = values[i];
-        if (v instanceof JsonbValue) {
-          params.push(JSON.stringify(v.data));
-          query += `$${params.length}::jsonb`;
-        } else {
-          params.push(v);
-          query += `$${params.length}`;
-        }
-      }
-    });
-    return pool.query(query, params).then(r => r.rows as Row[]);
-  };
-
-  // For raw migration SQL — split on semicolons and run each statement.
-  sql.unsafe = async (rawSql: string): Promise<void> => {
-    const stmts = rawSql
-      .split(';')
-      .map(s => s.trim())
-      .filter(s => s.length > 0);
-    for (const stmt of stmts) {
-      await pool.query(stmt);
-    }
-  };
-
-  sql.json = (value: unknown): JsonbValue => new JsonbValue(value);
-
-  return sql;
-}
 
 export function getDb(): SqlClient {
   if (!_client) {
-    _pool = new Pool({ connectionString: env.DATABASE_URL, max: 5 });
-    _client = buildClient(_pool);
-    log.info('DB connected via Neon serverless (WebSocket → port 443)');
+    const neonFn = neon(env.DATABASE_URL);
+
+    const sql = (strings: TemplateStringsArray, ...values: unknown[]): Promise<Row[]> => {
+      // Inline JsonbValue → encode as JSON string and add ::jsonb cast in the query.
+      const resolvedStrings: string[] = [];
+      const resolvedValues: unknown[] = [];
+
+      strings.forEach((str, i) => {
+        if (i < values.length && values[i] instanceof JsonbValue) {
+          resolvedStrings.push(str + '$__JSONB__');
+          resolvedValues.push(JSON.stringify((values[i] as JsonbValue).data));
+        } else {
+          resolvedStrings.push(str);
+          if (i < values.length) resolvedValues.push(values[i]);
+        }
+      });
+
+      // Rebuild a proper TemplateStringsArray-compatible object by reconstructing
+      // the query string with ::jsonb casts injected at the right positions.
+      let query = '';
+      const params: unknown[] = [];
+      resolvedStrings.forEach((str, i) => {
+        if (str.endsWith('$__JSONB__')) {
+          query += str.slice(0, -10); // remove sentinel
+          params.push(resolvedValues[i]);
+          query += `$${params.length}::jsonb`;
+        } else {
+          query += str;
+          if (i < resolvedValues.length) {
+            params.push(resolvedValues[i]);
+            query += `$${params.length}`;
+          }
+        }
+      });
+
+      // Use neonFn with a pre-built parameterized query string.
+      return neonFn.query(query, params as string[]) as Promise<Row[]>;
+    };
+
+    // For the migration SQL file: split on semicolons and run each statement.
+    sql.unsafe = async (rawSql: string): Promise<void> => {
+      const stmts = rawSql.split(';').map(s => s.trim()).filter(s => s.length > 0);
+      for (const stmt of stmts) {
+        await neonFn.query(stmt, []);
+      }
+    };
+
+    sql.json = (value: unknown): JsonbValue => new JsonbValue(value);
+
+    _client = sql as unknown as SqlClient;
+    log.info('DB connected via Neon HTTP API (port 443)');
   }
   return _client;
 }
 
 export async function closeDb(): Promise<void> {
-  if (_pool) {
-    await _pool.end();
-    _pool = null;
-    _client = null;
-  }
+  _client = null;
 }
