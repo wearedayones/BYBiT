@@ -133,3 +133,51 @@ async def trigger_ambiguous_decision(
         dedupe_key=f"ambiguous:{symbol}:{strategy}",
         ttl=timedelta(minutes=30),
     )
+
+
+async def trigger_signal_drought(
+    db: NeonHttpClient,
+    *,
+    signals_fired: int,
+    cycles_blocked: int,
+    rejection_summary: dict[str, Any],
+    cycle_id: str | None = None,
+) -> str | None:
+    """Fire when signals are generated but every one is rejected for an extended period.
+
+    The loop fires this after SIGNAL_DROUGHT_THRESHOLD consecutive cycles where signals
+    exist but none pass the risk gate. The AI should inspect rejection reasons via
+    `bybit report` and adjust risk parameters with `bybit tune`.
+    """
+    top = rejection_summary.get("top_rejections", [])
+    top_str = "; ".join(
+        f"{r['strategy']}/{r['reason']} ×{r['count']}" for r in top[:5]
+    ) or "none recorded"
+    return await enqueue(
+        db,
+        kind="risk_escalation",
+        severity="warning",
+        title=f"Signal drought: {signals_fired} signals blocked over {cycles_blocked} cycles",
+        summary=(
+            f"The bot generated signals for {cycles_blocked} consecutive cycles but no trade "
+            f"passed the risk gate. Total blocked signals: {signals_fired}. "
+            f"Top rejection reasons: {top_str}. "
+            "Run `bybit report --period daily --json` then `bybit tune --list --json` "
+            "to review risk parameters. Common fixes: raise maxRiskPct, check equity, "
+            "review circuit breaker state."
+        ),
+        default_action="acknowledge",
+        context={
+            "signals_fired": signals_fired,
+            "cycles_blocked": cycles_blocked,
+            **rejection_summary,
+        },
+        cycle_id=cycle_id,
+        options=[
+            {"action": "acknowledge", "label": "Acknowledge — will review and tune"},
+            {"action": "tune", "label": "Adjust risk params (use bybit tune)"},
+            {"action": "pause", "label": "Pause for manual inspection"},
+        ],
+        dedupe_key="signal_drought",
+        ttl=timedelta(hours=4),
+    )

@@ -14,6 +14,8 @@ from bybit_agent.config.constants import (
     CYCLE_INTERVAL_MS,
     REPO_POLL_INTERVAL_MS,
 )
+
+SIGNAL_DROUGHT_THRESHOLD = 60  # consecutive cycles with signals but no approval (~1 h)
 from bybit_agent.core.errors import KillSwitchError
 from bybit_agent.core.logger import get_logger
 from bybit_agent.exchange.bybit_client import BybitClient
@@ -63,6 +65,9 @@ class AgentLoop:
         self._last_repo_check = 0.0
         self._last_discovery = 0.0
         self._watched_symbols: list[str] = list(FALLBACK_SYMBOLS)
+
+        self._no_trade_cycles: int = 0       # consecutive cycles: signals exist but all rejected
+        self._drought_signals_seen: int = 0  # accumulated signal count across drought window
 
     async def start(self) -> None:
         self._running = True
@@ -152,6 +157,7 @@ class AgentLoop:
                 log.error("Decision engine error", error=str(e))
 
         # ── 5. Execute signals (paper=True means shadow-only) ───────────────
+        any_approved = False
         for sig in signals:
             if self._kill.is_engaged():
                 break
@@ -190,6 +196,8 @@ class AgentLoop:
                     cycle_id, sig.symbol, sig.strategy,
                 )
                 continue
+
+            any_approved = True  # at least one signal passed the risk gate this cycle
 
             # paper=True: DecisionEngine already wrote the shadow row. We skip live execution.
             # When paper=False (Phase 6 cutover), the block below fires.
@@ -242,6 +250,24 @@ class AgentLoop:
                         json.dumps({"error": str(e)}),
                         cycle_id, sig.symbol, sig.strategy,
                     )
+
+        # ── 5b. Signal drought tracking ─────────────────────────────────────
+        if signals and not any_approved:
+            self._no_trade_cycles += 1
+            self._drought_signals_seen += len(signals)
+            if self._no_trade_cycles % 10 == 0:
+                log.warning("Signal drought accumulating",
+                            cycles=self._no_trade_cycles,
+                            signals_seen=self._drought_signals_seen)
+            if self._no_trade_cycles >= SIGNAL_DROUGHT_THRESHOLD:
+                asyncio.create_task(
+                    self._fire_signal_drought(cycle_id, self._drought_signals_seen, self._no_trade_cycles)
+                )
+                self._no_trade_cycles = 0
+                self._drought_signals_seen = 0
+        else:
+            self._no_trade_cycles = 0
+            self._drought_signals_seen = 0
 
         # ── 6. Bot tick ─────────────────────────────────────────────────────
         if not daily_limit_hit and not self._kill.is_engaged():
@@ -332,3 +358,34 @@ class AgentLoop:
             await check_and_update()
         except Exception as e:
             log.warning("Repo check failed", error=str(e))
+
+    async def _fire_signal_drought(
+        self, cycle_id: str, signals_seen: int, cycles_blocked: int
+    ) -> None:
+        try:
+            from bybit_agent.events.triggers import trigger_signal_drought
+            rows = await self._db.fetch(
+                """SELECT strategy, reject_reason, COUNT(*)::int AS cnt
+                   FROM decision_log
+                   WHERE approved = false
+                     AND reject_reason IS NOT NULL
+                     AND created_at > now() - interval '2 hours'
+                   GROUP BY strategy, reject_reason
+                   ORDER BY cnt DESC
+                   LIMIT 10"""
+            )
+            top_rejections = [
+                {"strategy": r["strategy"], "reason": r["reject_reason"], "count": r["cnt"]}
+                for r in (rows or [])
+            ]
+            await trigger_signal_drought(
+                self._db,
+                signals_fired=signals_seen,
+                cycles_blocked=cycles_blocked,
+                rejection_summary={"top_rejections": top_rejections},
+                cycle_id=cycle_id,
+            )
+            log.info("Signal drought event fired",
+                     cycles_blocked=cycles_blocked, signals_seen=signals_seen)
+        except Exception as e:
+            log.warning("Signal drought trigger failed", error=str(e))
