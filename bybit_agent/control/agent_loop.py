@@ -155,17 +155,17 @@ class AgentLoop:
         for sig in signals:
             if self._kill.is_engaged():
                 break
-            if self._portfolio.has_open_position(sig["symbol"]):
-                log.debug("Skipping entry — position already open", symbol=sig["symbol"])
+            if self._portfolio.has_open_position(sig.symbol):
+                log.debug("Skipping entry — position already open", symbol=sig.symbol)
                 continue
 
-            snap = next((s for s in snapshots if s.symbol == sig["symbol"]), None)
+            snap = next((s for s in snapshots if s.symbol == sig.symbol), None)
             if not snap:
                 continue
 
             instrument = None
             try:
-                instrument = await self._market.get_instrument("linear", sig["symbol"])
+                instrument = await self._market.get_instrument("linear", sig.symbol)
             except Exception:
                 continue
             if not instrument:
@@ -179,7 +179,7 @@ class AgentLoop:
             }
 
             if not approval.approved:
-                log.debug("Signal rejected", reason=approval.reason, symbol=sig["symbol"])
+                log.debug("Signal rejected", reason=approval.reason, symbol=sig.symbol)
                 await self._db.execute(
                     """UPDATE decision_log
                        SET approved = false, reject_reason = $1,
@@ -187,7 +187,7 @@ class AgentLoop:
                        WHERE cycle_id = $3::uuid AND symbol = $4 AND strategy = $5""",
                     approval.reason,
                     __import__("json").dumps(econ),
-                    cycle_id, sig["symbol"], sig["strategy"],
+                    cycle_id, sig.symbol, sig.strategy,
                 )
                 continue
 
@@ -195,12 +195,12 @@ class AgentLoop:
             # When paper=False (Phase 6 cutover), the block below fires.
             if not self._decisions.paper:
                 try:
-                    side = "Buy" if sig["action"] == "enter_long" else "Sell"
-                    order_link_id = f"agent-{sig['strategy']}-{sig['symbol']}-{int(time.time() * 1000)}"
-                    ref_price = sig.get("suggestedEntry") or snap.lastPrice
+                    side = "Buy" if sig.action == "enter_long" else "Sell"
+                    order_link_id = f"agent-{sig.strategy}-{sig.symbol}-{int(time.time() * 1000)}"
+                    ref_price = sig.suggestedEntry or snap.lastPrice
                     result = await self._execution.enter(EnterParams(
                         category="linear",
-                        symbol=sig["symbol"],
+                        symbol=sig.symbol,
                         side=side,
                         qty=approval.qty,
                         refPrice=ref_price,
@@ -217,30 +217,30 @@ class AgentLoop:
                            FROM decision_log
                            WHERE cycle_id = $8::uuid AND symbol = $3 AND strategy = $9
                            LIMIT 1""",
-                        result.orderId, result.orderLinkId, sig["symbol"],
+                        result.orderId, result.orderLinkId, sig.symbol,
                         side,
                         "Limit" if result.fillType == "maker" else "Market",
-                        approval.qty, is_testnet, cycle_id, sig["strategy"],
+                        approval.qty, is_testnet, cycle_id, sig.strategy,
                     )
                     await self._db.execute(
                         """UPDATE decision_log
                            SET approved = true, outcome = 'executed',
                                inputs = COALESCE(inputs, '{}'::jsonb) || $1::jsonb
                            WHERE cycle_id = $2::uuid AND symbol = $3 AND strategy = $4""",
-                        json.dumps(econ), cycle_id, sig["symbol"], sig["strategy"],
+                        json.dumps(econ), cycle_id, sig.symbol, sig.strategy,
                     )
-                    log.info("Order placed", symbol=sig["symbol"], side=side,
-                             qty=approval.qty, strategy=sig["strategy"],
+                    log.info("Order placed", symbol=sig.symbol, side=side,
+                             qty=approval.qty, strategy=sig.strategy,
                              fill=result.fillType)
                 except Exception as e:
-                    log.error("Order failed", symbol=sig["symbol"], error=str(e))
+                    log.error("Order failed", symbol=sig.symbol, error=str(e))
                     import json
                     await self._db.execute(
                         """UPDATE decision_log
                            SET outcome = 'failed', outcome_detail = $1::jsonb
                            WHERE cycle_id = $2::uuid AND symbol = $3 AND strategy = $4""",
                         json.dumps({"error": str(e)}),
-                        cycle_id, sig["symbol"], sig["strategy"],
+                        cycle_id, sig.symbol, sig.strategy,
                     )
 
         # ── 6. Bot tick ─────────────────────────────────────────────────────
