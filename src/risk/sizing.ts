@@ -48,8 +48,7 @@ export function computePositionSize(input: SizingInput): SizingResult {
   // Snap to step
   qty = qty.div(qtyStep).floor().mul(qtyStep);
 
-  // Clamp
-  if (qty.lt(minQty)) return { qty: 0, riskAmount: 0, notional: 0, riskPct: 0 };
+  // Clamp to maxQty
   if (qty.gt(maxQty)) qty = maxQty;
 
   // Cap notional at maxExposurePct if provided
@@ -58,7 +57,23 @@ export function computePositionSize(input: SizingInput): SizingResult {
     const notional = qty.mul(entry);
     if (notional.gt(maxNotional)) {
       qty = maxNotional.div(entry).div(qtyStep).floor().mul(qtyStep);
-      if (qty.lt(minQty)) return { qty: 0, riskAmount: 0, notional: 0, riskPct: 0 };
+    }
+  }
+
+  // Snap to step after caps
+  qty = qty.div(qtyStep).floor().mul(qtyStep);
+
+  // Min-lot rounding: when risk-based qty falls below the exchange minimum,
+  // round up to minQty only if the resulting stop-loss risk stays within 5× the
+  // risk budget. This allows small accounts to enter instruments where the min-lot
+  // risk is modestly above the target (e.g., ETH on a $100 account) while still
+  // blocking instruments where it would be dangerously outsized (e.g., BTC).
+  if (qty.lt(minQty)) {
+    const minLotRisk = minQty.mul(riskPerUnit);
+    if (minLotRisk.lte(riskBudget.mul(5))) {
+      qty = minQty;
+    } else {
+      return { qty: 0, riskAmount: 0, notional: 0, riskPct: 0 };
     }
   }
 

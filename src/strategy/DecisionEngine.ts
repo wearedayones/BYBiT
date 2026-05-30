@@ -127,7 +127,9 @@ export class DecisionEngine {
 export function classifyRegime(snap: MarketSnapshot): Regime {
   const { adxValue, atrPct } = snap.indicators;
   const fundingAbs = Math.abs(snap.fundingRate);
-  if (atrPct > 0.05 || fundingAbs > 0.002) return 'crisis';
+  // Crisis = chaotic extreme volatility (high ATR without direction) OR funding blowout.
+  // High ATR + strong trend (ADX > 25) is a trending market, not a crisis.
+  if ((atrPct > 0.05 && adxValue < 25) || fundingAbs > 0.002) return 'crisis';
   if (adxValue > 25) return 'trending';
   if (atrPct > 0.025) return 'high_volatility';
   return 'ranging';

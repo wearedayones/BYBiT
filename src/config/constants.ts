@@ -44,7 +44,7 @@ export const FEES = {
 // Cost / expectancy gating — a trade must clear its own friction with margin to spare.
 export const COST_DEFAULTS = {
   SLIPPAGE_PCT: 0.0005,      // 0.05% per fill — matches the sim's slippage model
-  MIN_NET_EDGE_PCT: 0.0015,  // require ≥0.15% expected net move after all costs
+  MIN_NET_EDGE_PCT: 0.0005,  // require ≥0.05% expected net move after all costs
   MIN_REWARD_RISK: 1.2,      // reject trades whose TP can't clear costs vs the stop
 } as const;
 

@@ -65,8 +65,10 @@ export function expectedValue(
   if (avgLoss <= 0) return null;
 
   // A learned prior arrives as a win-rate already floored at 0.5 (or 1.0 when
-  // unknown). Treat the unknown/over-optimistic case as a neutral coin flip.
-  const winProb = learnedPrior >= 0.999 ? 0.5 : Math.min(0.95, Math.max(0.05, learnedPrior));
+  // unknown). Treat the unknown case as a slight positive bias (0.55) — a
+  // directional signal that passed strategy and regime filters isn't a pure
+  // coin flip. Once enough trades accumulate the learned rate takes over.
+  const winProb = learnedPrior >= 0.999 ? 0.55 : Math.min(0.95, Math.max(0.05, learnedPrior));
 
   const ev = winProb * avgWin - (1 - winProb) * avgLoss - costPct;
   const rewardRisk = avgWin / avgLoss;

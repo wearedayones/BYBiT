@@ -3,7 +3,7 @@ import type { MarketSnapshot } from '../../market/MarketDataService';
 
 export const TrendMomentum: Strategy = {
   name: 'trend_momentum',
-  suitableRegimes: ['trending'],
+  suitableRegimes: ['trending', 'high_volatility'],
   evaluate(snap: MarketSnapshot, _ctx: StrategyContext): Signal {
     const { ema9, ema21, ema50, rsi14, macdHistogram, adxValue } = snap.indicators;
     const price = snap.lastPrice;
