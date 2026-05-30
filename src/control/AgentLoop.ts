@@ -26,7 +26,7 @@ const log = childLogger({ module: 'agent-loop' });
 // Seed list used only until the first market-discovery pass populates the
 // balance-aware watch list; after that the agent picks its own universe.
 const FALLBACK_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
-const DISCOVERY_INTERVAL_MS = 30 * 60 * 1000; // re-survey the market every 30 min
+const DISCOVERY_INTERVAL_MS = 5 * 60 * 1000; // re-survey the market every 5 min
 
 export class AgentLoop {
   private running = false;
