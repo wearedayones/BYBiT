@@ -5,6 +5,7 @@ import { loadSkill } from './skill/skillLoader';
 import { checkAndUpdateSkill } from './skill/skillUpdater';
 import { getDb, closeDb } from './persistence/db';
 import { BybitClient } from './exchange/BybitClient';
+import { resolveBybitAuth } from './exchange/credentials';
 import { AgentLoop } from './control/AgentLoop';
 import { logger } from './core/logger';
 
@@ -37,7 +38,7 @@ async function main() {
 
   // Quick clock check via public endpoint
   try {
-    const client = new BybitClient(env.BYBIT_API_KEY, env.BYBIT_API_SECRET, isTestnet);
+    const client = new BybitClient(resolveBybitAuth(env), isTestnet);
     const serverTime = await client.getServerTime();
     const diff = Math.abs(Date.now() - serverTime);
     if (diff > 5000) {

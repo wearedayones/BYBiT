@@ -5,6 +5,7 @@ import {
 import {
   buildGetParamStr, buildPostParamStr, buildHeaders,
 } from './signer';
+import type { BybitAuth } from './signer';
 import { rateLimiter } from './rateLimiter';
 import { BybitApiError, BotApiError } from '../core/errors';
 import { childLogger } from '../core/logger';
@@ -20,12 +21,13 @@ export class BybitClient {
   private baseUrl: string;
 
   constructor(
-    private readonly apiKey: string,
-    private readonly secret: string,
+    private readonly auth: BybitAuth,
     isTestnet: boolean,
   ) {
     this.baseUrl = isTestnet ? TESTNET_REST : MAINNET_REST;
   }
+
+  private get apiKey(): string { return this.auth.apiKey; }
 
   setTestnet(isTestnet: boolean) {
     this.baseUrl = isTestnet ? TESTNET_REST : MAINNET_REST;
@@ -237,7 +239,7 @@ export class BybitClient {
       const basePath = qsStart >= 0 ? pathWithQs.slice(0, qsStart) : pathWithQs;
       const qs = qsStart >= 0 ? pathWithQs.slice(qsStart + 1) : '';
       const paramStr = buildGetParamStr(ts, this.apiKey, qs);
-      const reqHeaders = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
+      const reqHeaders = buildHeaders(this.auth, ts, paramStr, USER_AGENT, X_REFERER);
       const url = `${this.baseUrl}${pathWithQs}`;
       log.debug({ url }, 'GET (auth)');
       const res = await request(url, { method: 'GET', headers: reqHeaders });
@@ -257,7 +259,7 @@ export class BybitClient {
       const ts = Date.now();
       const jsonBody = JSON.stringify(payload);
       const paramStr = buildPostParamStr(ts, this.apiKey, jsonBody);
-      const reqHeaders = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
+      const reqHeaders = buildHeaders(this.auth, ts, paramStr, USER_AGENT, X_REFERER);
       const url = `${this.baseUrl}${path}`;
       log.debug({ url, payload }, 'POST (auth)');
       const res = await request(url, { method: 'POST', headers: reqHeaders, body: jsonBody });
@@ -277,7 +279,7 @@ export class BybitClient {
       const ts = Date.now();
       const jsonBody = JSON.stringify(payload);
       const paramStr = buildPostParamStr(ts, this.apiKey, jsonBody);
-      const reqHeaders = buildHeaders(this.apiKey, this.secret, ts, paramStr, USER_AGENT, X_REFERER);
+      const reqHeaders = buildHeaders(this.auth, ts, paramStr, USER_AGENT, X_REFERER);
       const url = `${this.baseUrl}${path}`;
       log.debug({ url, payload }, 'BOT POST');
       const res = await request(url, { method: 'POST', headers: reqHeaders, body: jsonBody });
