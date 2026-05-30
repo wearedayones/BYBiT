@@ -52,24 +52,36 @@ STEP 2 — Create the env file
   cp .env.example .env
 
 STEP 3 — Collect credentials from the user (ask once, all at once)
-  Send the user a single message asking for all 5 values:
+  Send the user a single message asking for:
 
+    REQUIRED:
     a) Bybit API Key       → BYBIT_API_KEY
-       Where to get it: Bybit → API Management → sub-account key
+       Bybit → API Management → sub-account key
        Permissions: Read + Trade ONLY. NEVER enable Withdraw.
 
-    b) Bybit API Secret    → BYBIT_API_SECRET
+    b) Bybit API signing — ask which type they have:
+       • HMAC (classic): they have a Secret string  → BYBIT_API_SECRET
+       • RSA  (AI sub-account): they have a private key file or content
+                                → BYBIT_API_PRIVATE_KEY_PATH or BYBIT_API_PRIVATE_KEY
 
-    c) Supabase URL        → DATABASE_URL
-       Where to get it: supabase.com → project → Settings → Database → Connection string
+    c) Database URL        → DATABASE_URL
        Format: postgresql://user:password@host:5432/dbname
+       Neon (neon.tech) and Supabase (supabase.com) both work; Neon is recommended
+       for cloud environments (HTTP API on port 443, no firewall issues).
 
-    d) Gmail address       → REPORT_EMAIL
-       (for daily/weekly/monthly performance reports)
+    NOTIFICATIONS (ask for at least one):
+    d) Telegram Bot Token  → TELEGRAM_BOT_TOKEN   ← recommended for cloud hosts
+       Telegram Chat ID    → TELEGRAM_CHAT_ID
+       How: message @BotFather → /newbot → copy token; send a message to the bot,
+       then GET https://api.telegram.org/bot<TOKEN>/getUpdates to find your chat id
 
-    e) Gmail App Password  → REPORT_EMAIL_APP_PASSWORD
-       Where to get it: Google Account → Security → 2-Step Verification → App Passwords
-       This is NOT your Gmail password — it is a 16-character app-specific code.
+    e) Gmail address       → REPORT_EMAIL          ← may not work on cloud (SMTP blocked)
+       Gmail App Password  → REPORT_EMAIL_APP_PASSWORD (16-char code, not your password)
+
+    OPTIONAL:
+    f) BYBIT_PROXY_URL — only if Bybit API calls fail (cloud IP geo-blocked).
+       Deploy workers/bybit-proxy.ts to Cloudflare Workers with Region=Asia-east1,
+       then set this to your worker URL.
 
   Fill each value into .env.
   Display rule: show API keys as AbCdE...x1y2 (first 5 + last 4 only). Never log full secrets.
@@ -119,27 +131,32 @@ Run these to get complete agent state — no log files needed:
 SELECT env, status, kill_engaged, equity, peak_equity, last_cycle_at
 FROM agent_state WHERE id = 'singleton';
 
+-- What the agent is watching right now (balance-adaptive market discovery)
+SELECT DISTINCT ON (symbol) symbol, score, min_notional, equity_at_discovery, discovered_at
+FROM discovered_markets ORDER BY symbol, discovered_at DESC;
+
+-- Recent decisions with EV and fill type
+SELECT symbol, strategy, approved, reject_reason,
+  inputs->>'ev' as ev, inputs->>'rewardRisk' as rr, inputs->>'fillType' as fill
+FROM decision_log ORDER BY id DESC LIMIT 20;
+
 -- Strategy performance (PnL by strategy)
 SELECT strategy,
-  ROUND(SUM(realized_pnl)::numeric, 2)  AS total_pnl,
-  COUNT(*)                               AS trades,
+  ROUND(SUM(realized_pnl)::numeric, 2) AS total_pnl,
+  COUNT(*)                              AS trades,
   ROUND(AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END)::numeric, 2) AS win_rate
 FROM trades GROUP BY strategy ORDER BY total_pnl DESC;
 
 -- Equity curve (last 50 snapshots)
 SELECT ts, total_equity, drawdown_pct FROM equity_snapshots ORDER BY ts DESC LIMIT 50;
 
--- Full performance report (complete HTML — one row covers everything)
+-- Full performance report (complete HTML)
 SELECT subject, html_body, ts FROM report_history ORDER BY ts DESC LIMIT 1;
 
 -- Recent risk events
 SELECT ts, type, severity, detail FROM risk_events ORDER BY ts DESC LIMIT 20;
 
--- Current market sentiment
-SELECT ts, fear_greed_index, fear_greed_label, global_sentiment, trending_symbols
-FROM market_sentiment ORDER BY ts DESC LIMIT 1;
-
--- Strategy weights (what the agent is prioritising right now)
+-- Strategy weights (what the agent is prioritising)
 SELECT strategy, weight, enabled, win_rate FROM strategy_weights ORDER BY weight DESC;
 ```
 
@@ -173,15 +190,22 @@ git clone https://github.com/wearedayones/BYBiT.git && cd BYBiT
 # 2. Install
 npm install
 
-# 3. Configure — copy and fill 5 values
+# 3. Configure — copy and fill credentials
 cp .env.example .env
+# Required: BYBIT_API_KEY + one of BYBIT_API_SECRET / BYBIT_API_PRIVATE_KEY_PATH
+# Required: DATABASE_URL
+# Recommended: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  (email is blocked on most cloud hosts)
 
 # 4. Start
 npm start
 ```
 
-The agent auto-runs migrations, starts in testnet mode, and promotes itself to mainnet
-when performance criteria are met. No further setup required.
+**No cron jobs needed.** The agent is a single long-running process that manages its own
+schedule internally: trading every 60s, market discovery every 5 min, reports daily/weekly/monthly.
+Keep it alive with PM2 (`pm2 start npm -- start`) or systemd.
+
+The agent auto-runs migrations, starts in testnet mode, discovers what it can afford to trade
+at your balance, and promotes itself to mainnet when performance criteria are met.
 
 ---
 
@@ -216,11 +240,17 @@ automatically and sends you an email confirmation.
 
 ### What It Trades
 
-| Layer | Instruments | Frequency |
+The agent discovers its own trading universe based on current balance — no fixed symbols.
+Every 5 minutes it surveys all linear perpetual contracts, ranks them by liquidity + volatility
++ how much margin one minimum lot costs relative to the account, and keeps the top markets
+it can actually afford. A $10 account trades cheap coins (XRP, HBAR, DOGE). A $10,000 account
+also has access to BTC and ETH. The list updates automatically as the balance grows.
+
+| Layer | What | When |
 |---|---|---|
-| Spot + Futures | BTCUSDT, ETHUSDT, SOLUSDT | Every cycle (~60s adaptive) |
-| Native Bots | Grid, DCA, Martingale, Combo | Activated by market regime |
-| Copy Trading | Top-scored leaders | Auto-followed and dropped by performance |
+| Futures | Balance-adaptive symbol universe (auto-discovered) | Every cycle (~60s) |
+| Native Grid Bots | Spot-grid launched on Bybit exchange | Ranging market regime |
+| Copy Trading | Top-scored leaders followed automatically | Mainnet; reviewed every 4h |
 
 ### Decision Intelligence
 
