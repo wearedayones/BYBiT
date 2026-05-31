@@ -1072,5 +1072,298 @@ def watch(
         typer.echo("\nbybit watch stopped.")
 
 
+# ── strategy management (the "strategy agent" surface) ─────────────────────────
+
+strategy_app = typer.Typer(add_completion=False, help="Manage strategies: create, edit, backtest, accept, pause.")
+app.add_typer(strategy_app, name="strategy")
+
+
+def _bt_klines(symbol: str, interval: str, bars: int) -> dict:
+    """Fetch klines and convert to the OHLCV the backtester consumes."""
+    from .config.env import get_env
+    from .exchange.bybit_client import BybitClient
+    from .exchange.credentials import resolve_bybit_auth
+    from .market.market_data import klines_to_ohlcv
+
+    async def _run():
+        env = get_env()
+        client = BybitClient(resolve_bybit_auth(env), is_testnet=(env.BYBIT_ENV == "testnet"))
+        try:
+            kl = await client.get_kline("linear", symbol, interval, min(bars, 1000))
+        finally:
+            await client.aclose()
+        return klines_to_ohlcv(kl)
+
+    return asyncio.run(_run())
+
+
+@strategy_app.command("list")
+def strategy_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List all strategies and their lifecycle state."""
+    async def _run():
+        from .strategy.registry import list_strategies
+        db = await _get_db()
+        try:
+            rows = await list_strategies(db)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+        return rows
+
+    rows = asyncio.run(_run())
+    if as_json:
+        _print_json([dict(r) for r in rows])
+        return
+    typer.echo(f"\n{'name':<20} {'base':<16} {'status':<11} {'on':<4} {'weight':<7} backtest")
+    typer.echo("-" * 78)
+    for r in rows:
+        bt = r.get("backtest")
+        if isinstance(bt, str):
+            try:
+                bt = json.loads(bt)
+            except Exception:
+                bt = None
+        bt_str = "—"
+        if bt:
+            mark = "✓PASS" if bt.get("passed") else "✗FAIL"
+            bt_str = f"{mark} ret={bt.get('total_return_pct')}% win={bt.get('win_rate')} n={bt.get('n_trades')}"
+        typer.echo(f"{r['name']:<20} {r['base_strategy']:<16} {r['status']:<11} "
+                   f"{'yes' if r['enabled'] else 'no':<4} {float(r['weight']):<7.2f} {bt_str}")
+
+
+@strategy_app.command("show")
+def strategy_show(name: str, as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Show one strategy's full config + last backtest."""
+    async def _run():
+        from .strategy.registry import get_strategy
+        db = await _get_db()
+        try:
+            return await get_strategy(db, name)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    s = asyncio.run(_run())
+    if not s:
+        typer.echo(f"Strategy '{name}' not found."); raise typer.Exit(1)
+    _print_json(dict(s)) if as_json else _print_json(dict(s))
+
+
+@strategy_app.command("create")
+def strategy_create(
+    name: str,
+    base: Annotated[str, typer.Option("--base", help="Base strategy class key")],
+    params: Annotated[str, typer.Option("--params", help='JSON params, e.g. \'{"threshold":0.2}\'')] = "{}",
+    weight: Annotated[float, typer.Option("--weight")] = 1.0,
+    notes: Annotated[Optional[str], typer.Option("--notes")] = None,
+) -> None:
+    """Create a new (draft) strategy. Must be backtested + accepted before it trades."""
+    async def _run():
+        from .strategy.registry import create_strategy, StrategyError
+        db = await _get_db()
+        try:
+            await create_strategy(db, name=name, base_strategy=base,
+                                  params=json.loads(params), weight=weight, notes=notes)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"✅ Created draft strategy '{name}'. Next: bybit strategy backtest {name}")
+
+
+@strategy_app.command("edit")
+def strategy_edit(
+    name: str,
+    params: Annotated[Optional[str], typer.Option("--params", help="New JSON params (resets to draft)")] = None,
+    weight: Annotated[Optional[float], typer.Option("--weight")] = None,
+    notes: Annotated[Optional[str], typer.Option("--notes")] = None,
+) -> None:
+    """Edit a strategy. Changing --params invalidates its backtest (back to draft)."""
+    async def _run():
+        from .strategy.registry import update_strategy
+        db = await _get_db()
+        try:
+            await update_strategy(db, name,
+                                  params=json.loads(params) if params else None,
+                                  weight=weight, notes=notes)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"✅ Updated '{name}'." + (" Params changed — re-backtest required." if params else ""))
+
+
+@strategy_app.command("delete")
+def strategy_delete(
+    name: str,
+    force: Annotated[bool, typer.Option("--force")] = False,
+) -> None:
+    """Delete a strategy from the registry."""
+    if not force and not typer.confirm(f"Delete strategy '{name}'?", default=False):
+        typer.echo("Aborted."); return
+
+    async def _run():
+        from .strategy.registry import delete_strategy
+        db = await _get_db()
+        try:
+            await delete_strategy(db, name)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"🗑️  Deleted '{name}'.")
+
+
+@strategy_app.command("backtest")
+def strategy_backtest(
+    name: str,
+    symbol: Annotated[str, typer.Option("--symbol")] = "BTCUSDT",
+    interval: Annotated[str, typer.Option("--interval", help="Kline interval (e.g. 15, 60)")] = "15",
+    bars: Annotated[int, typer.Option("--bars")] = 500,
+    accept_if_pass: Annotated[bool, typer.Option("--accept", help="Auto-accept if it passes")] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Backtest a strategy over historical klines and record the verdict."""
+    from .strategy.backtest import backtest_strategy, BacktestConfig
+    from .strategy.registry import instantiate, record_backtest, accept, get_strategy
+
+    ohlcv = _bt_klines(symbol, interval, bars)
+
+    async def _run():
+        db = await _get_db()
+        try:
+            s = await get_strategy(db, name)
+            if not s:
+                return {"error": f"Strategy '{name}' not found."}
+            params = s.get("params") or {}
+            if isinstance(params, str):
+                params = json.loads(params)
+            inst = instantiate(s["base_strategy"], params, name=name)
+            result = backtest_strategy(inst, ohlcv, symbol=symbol, cfg=BacktestConfig())
+            await record_backtest(db, name, result.metrics(), result.passed)
+            accepted = False
+            if result.passed and accept_if_pass:
+                await accept(db, name)
+                accepted = True
+            return {"metrics": result.metrics(), "accepted": accepted}
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    out = asyncio.run(_run())
+    if "error" in out:
+        typer.echo(f"❌ {out['error']}"); raise typer.Exit(1)
+    if as_json:
+        _print_json(out); return
+    m = out["metrics"]
+    verdict = "✓ PASSED" if m["passed"] else "✗ FAILED"
+    typer.echo(f"\n── BACKTEST {name} on {symbol} ({bars} × {interval}m) ──")
+    typer.echo(f"  trades={m['n_trades']}  win={m['win_rate']:.0%}  return={m['total_return_pct']:+.2f}%")
+    typer.echo(f"  profit_factor={m['profit_factor']}  max_dd={m['max_drawdown_pct']:.1f}%  sharpe={m['sharpe_like']}")
+    typer.echo(f"  {verdict}")
+    if m["fail_reasons"]:
+        for fr in m["fail_reasons"]:
+            typer.echo(f"    • {fr}")
+    if out["accepted"]:
+        typer.echo(f"  ✅ Auto-accepted — '{name}' is now live (enabled).")
+    elif m["passed"]:
+        typer.echo(f"  → Passed. Accept with: bybit strategy accept {name}")
+
+
+@strategy_app.command("accept")
+def strategy_accept(name: str) -> None:
+    """Accept a strategy (enable for trading). Requires a passing backtest."""
+    async def _run():
+        from .strategy.registry import accept
+        db = await _get_db()
+        try:
+            await accept(db, name)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"✅ Accepted '{name}' — now eligible to trade.")
+
+
+@strategy_app.command("reject")
+def strategy_reject(name: str) -> None:
+    """Reject a strategy (disable, mark rejected)."""
+    async def _run():
+        from .strategy.registry import reject
+        db = await _get_db()
+        try:
+            await reject(db, name)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"🚫 Rejected '{name}'.")
+
+
+@strategy_app.command("pause")
+def strategy_pause(name: str) -> None:
+    """Pause a strategy (stop trading it, keep it accepted)."""
+    async def _run():
+        from .strategy.registry import pause
+        db = await _get_db()
+        try:
+            await pause(db, name)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"⏸️  Paused '{name}'.")
+
+
+@strategy_app.command("resume")
+def strategy_resume(name: str) -> None:
+    """Resume a paused strategy (must be accepted)."""
+    async def _run():
+        from .strategy.registry import resume
+        db = await _get_db()
+        try:
+            await resume(db, name)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        typer.echo(f"❌ {e}"); raise typer.Exit(1)
+    typer.echo(f"▶️  Resumed '{name}'.")
+
+
+@strategy_app.command("bases")
+def strategy_bases() -> None:
+    """List the base strategy classes available to instantiate."""
+    from .strategy.registry import BASE_STRATEGIES
+    typer.echo("Available base strategies:")
+    for k, cls in sorted(BASE_STRATEGIES.items()):
+        regimes = ", ".join(getattr(cls, "suitable_regimes", []))
+        typer.echo(f"  {k:<18} suitable_regimes=[{regimes}]")
+
+
 if __name__ == "__main__":
     app()

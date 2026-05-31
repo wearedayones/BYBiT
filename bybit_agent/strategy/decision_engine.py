@@ -14,7 +14,7 @@ from ..core.logger import child_logger
 from ..market.market_data import classify_regime
 from ..market.news import compute_sentiment_multiplier
 from ..persistence.db import get_db
-from .base import Signal
+from .base import Signal, StrategyContext
 from .impl.breakout import Breakout
 from .impl.funding_harvest import FundingHarvest
 from .impl.mean_reversion import MeanReversion
@@ -54,24 +54,25 @@ class DecisionEngine:
 
     async def run(self, snapshots, cycle_id: str) -> list[WeightedSignal]:
         db = get_db()
-        rows = await db.fetch("SELECT strategy, weight, enabled FROM strategy_weights")
-        weight_map = {r["strategy"]: r for r in rows}
+
+        # Prefer the backtest-gated registry: only accepted+enabled strategies trade.
+        # Fall back to the hardcoded set + strategy_weights if the registry is empty
+        # (e.g. pre-migration deployments) so the loop never goes dark.
+        active = await self._load_active(db)
 
         results: list[WeightedSignal] = []
         for snap in snapshots:
             regime = classify_regime(snap)
-            for strategy in self._strategies:
-                w_row = weight_map.get(strategy.name)
-                if not w_row or not w_row["enabled"]:
-                    continue
-
+            for strategy, weight in active:
                 learned_prior = await self._get_learned_prior(strategy.name, regime, snap.symbol)
-                signal: Signal = strategy.evaluate(snap, _ctx(w_row, learned_prior))
+                signal: Signal = strategy.evaluate(snap, StrategyContext(
+                    strategyWeight=weight, learnedPrior=learned_prior))
                 if signal.action == "hold":
                     continue
+                # Record under the registry instance name (may differ from base).
+                signal.strategy = strategy.name
 
                 regime_mult = 1.0 if regime in strategy.suitable_regimes else 0.3
-                weight = float(w_row["weight"]) if w_row["weight"] is not None else 1.0
 
                 if signal.action in ("enter_long", "enter_short"):
                     sentiment_mult = compute_sentiment_multiplier(snap.research, signal.action)
@@ -100,6 +101,26 @@ class DecisionEngine:
         await self._persist(results, snapshots, cycle_id)
         log.info("Decisions computed", signals=len(results), cycle_id=cycle_id)
         return results
+
+    async def _load_active(self, db) -> list[tuple]:
+        """Accepted+enabled strategies from the registry; fall back to the hardcoded
+        baseline gated by strategy_weights if the registry is empty/unavailable."""
+        try:
+            from .registry import load_active_strategies
+            active = await load_active_strategies(db)
+            if active:
+                return active
+        except Exception as e:  # noqa: BLE001
+            log.warning("Registry load failed — falling back to strategy_weights", error=str(e))
+
+        rows = await db.fetch("SELECT strategy, weight, enabled FROM strategy_weights")
+        weight_map = {r["strategy"]: r for r in rows}
+        out: list[tuple] = []
+        for strat in self._strategies:
+            w = weight_map.get(strat.name)
+            if w and w.get("enabled"):
+                out.append((strat, float(w["weight"]) if w["weight"] is not None else 1.0))
+        return out
 
     async def _persist(self, results, snapshots, cycle_id: str) -> None:
         db = get_db()
@@ -146,12 +167,3 @@ class DecisionEngine:
         except Exception:  # noqa: BLE001
             pass
         return 1.0
-
-
-def _ctx(w_row, learned_prior):
-    from .base import StrategyContext
-
-    return StrategyContext(
-        strategyWeight=float(w_row["weight"]) if w_row["weight"] is not None else 1.0,
-        learnedPrior=learned_prior,
-    )
