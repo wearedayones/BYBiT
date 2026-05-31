@@ -1817,6 +1817,69 @@ def train(
 
 
 @app.command()
+def prune(
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would be deleted without deleting")] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Delete old DB rows to keep the system lean (safe; never touches trades/orders/model state).
+
+    Retention: decision_log 7d · equity_snapshots 30d · discovered_markets 3d ·
+    market_sentiment 30d · correlation_snapshots 7d · pnl_attribution 90d ·
+    resolved events 30d · brain_notes archived after 90d (not deleted).
+
+    Runs automatically once a week inside the trading loop.
+    """
+
+    async def _run() -> None:
+        from .maintenance.pruner import prune as _prune, _RETENTION, _PENDING_EVENT_RETENTION_DAYS
+
+        db = await _get_db()
+        if not db:
+            typer.echo("❌ DB unavailable", err=True)
+            raise typer.Exit(1)
+
+        if dry_run:
+            typer.echo("🔍 Dry-run — estimating rows that would be deleted:\n")
+            total = 0
+            for table, ts_col, days in _RETENTION:
+                try:
+                    r = await db.fetch(
+                        f"SELECT count(*) c FROM {table} "
+                        f"WHERE {ts_col} < now() - INTERVAL '{days} days'"
+                    )
+                    c = int(r[0].get("c") or 0) if r else 0
+                    total += c
+                    typer.echo(f"  {table:30s}  {c:>6} rows  (>{days}d old)")
+                except Exception as e:
+                    typer.echo(f"  {table:30s}  ERROR: {e}")
+            typer.echo(f"\n  Total would delete: {total} rows")
+            return
+
+        result = await _prune(db)
+        if as_json:
+            _print_json({
+                "deleted": result.deleted,
+                "total_deleted": result.total_deleted,
+                "archived_notes": result.archived_notes,
+                "errors": result.errors,
+                "ran_at": result.ran_at,
+            })
+            return
+
+        if result.total_deleted or result.archived_notes:
+            typer.echo(f"✅ Pruned {result.total_deleted} rows, archived {result.archived_notes} brain notes")
+            for table, count in result.deleted.items():
+                typer.echo(f"   {table}: -{count}")
+        else:
+            typer.echo("✅ Nothing to prune — DB is already clean.")
+        if result.errors:
+            for e in result.errors:
+                typer.echo(f"  ⚠️  {e}", err=True)
+
+    asyncio.run(_run())
+
+
+@app.command()
 def brain(
     note: Annotated[str, typer.Option("--note", help="Persist a lesson/decision to the DB ledger")] = "",
     category: Annotated[str, typer.Option("--category", help="lesson|decision|directive|observation")] = "lesson",

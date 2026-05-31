@@ -24,9 +24,10 @@ from bybit_agent.config.constants import (
     REPO_POLL_INTERVAL_MS,
 )
 
-SIGNAL_DROUGHT_THRESHOLD = 60   # consecutive cycles with signals but no approval (~1 h)
-ADAPT_EVERY_CYCLES = 10         # run adaptive_weight_decay every N cycles
-BRAIN_RENDER_INTERVAL_MS = 30 * 60 * 1000  # re-render brain.md every 30 minutes
+SIGNAL_DROUGHT_THRESHOLD = 60        # consecutive cycles with signals but no approval (~1 h)
+ADAPT_EVERY_CYCLES = 10              # run adaptive_weight_decay every N cycles
+BRAIN_RENDER_INTERVAL_MS  = 30 * 60 * 1_000        # re-render brain.md every 30 min
+PRUNE_INTERVAL_MS         = 7 * 24 * 60 * 60 * 1_000  # prune DB once per week
 from bybit_agent.core.errors import KillSwitchError
 from bybit_agent.core.logger import get_logger
 from bybit_agent.exchange.bybit_client import BybitClient
@@ -77,6 +78,7 @@ class AgentLoop:
         self._last_repo_check = 0.0
         self._last_discovery = 0.0
         self._last_brain_render = 0.0
+        self._last_prune = 0.0
         self._watched_symbols: list[str] = list(FALLBACK_SYMBOLS)
 
         self._no_trade_cycles: int = 0
@@ -385,6 +387,11 @@ class AgentLoop:
             self._last_brain_render = now
             asyncio.create_task(self._render_brain())
 
+        # ── 8c. Weekly DB prune ─────────────────────────────────────────────
+        if now - self._last_prune > PRUNE_INTERVAL_MS:
+            self._last_prune = now
+            asyncio.create_task(self._run_prune())
+
         # ── 9. Repo update check ────────────────────────────────────────────
         if now - self._last_repo_check > REPO_POLL_INTERVAL_MS:
             self._last_repo_check = now
@@ -532,6 +539,16 @@ class AgentLoop:
             pass
 
         return base
+
+    async def _run_prune(self) -> None:
+        try:
+            from bybit_agent.maintenance.pruner import prune
+            result = await prune(self._db)
+            if result.total_deleted or result.archived_notes:
+                log.info("Weekly prune done",
+                         deleted=result.total_deleted, archived=result.archived_notes)
+        except Exception as e:
+            log.warning("Weekly prune failed", error=str(e))
 
     async def _render_brain(self) -> None:
         try:
