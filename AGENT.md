@@ -184,21 +184,119 @@ The repo never calls Withdraw — but the key permission is your last line of de
 
 ## The Recurring Session Job (do this every time you return)
 
+Run these steps in order every session. Each step has a decision rule — follow it literally.
+
+### 1. Health check
 ```bash
-bybit status                            # equity, drawdown, kill flag, trading mode
-bybit events --json                     # list all pending events
-bybit event <UUID> --json               # read each event's full context
-bybit decide <UUID> --action approve    # approve a signal (ambiguous_decision)
-bybit decide <UUID> --action reject     # reject a signal
-bybit resolve <UUID> --action reviewed  # mark a scheduled_review complete
-bybit resolve <UUID> --action acknowledge  # acknowledge a risk_escalation
-bybit report --period daily --json      # performance digest
-bybit tune --list --json                # see all params with current values and bounds
-bybit tune --set maxRiskPct=0.012       # adjust a param (bounds enforced automatically)
-bybit weights --json                    # review strategy allocation
-bybit weights --set trend_momentum=1.2  # rebalance if performance data supports it
-bybit weights --toggle mean_reversion   # enable/disable a strategy
+bybit status --json
 ```
+Decision rules:
+- `kill_engaged: true` → STOP. Read `kill_reason`. Check recent logs. Do NOT restart until root cause is understood.
+- `status: paused` → ask the user why before resuming.
+- `drawdown_pct > 5` → read the daily report before doing anything else.
+- `equity == 0` → the wallet fetch failed. Wait one cycle (60s) and retry.
+- Anything else → continue.
+
+### 2. Drain the event queue
+```bash
+bybit events --json
+```
+For each pending event, read its full context and act:
+```bash
+bybit event <UUID> --json   # always read context before deciding
+```
+
+| Event kind | What to check | Default action |
+|---|---|---|
+| `scheduled_review` | Read daily report first, tune if needed | `bybit resolve <UUID> --action reviewed` |
+| `risk_escalation` | Check drawdown and open positions | `bybit resolve <UUID> --action acknowledged` — `bybit pause` if drawdown > 5% |
+| `market_event` | Check if spike is real (compare symbol vs BTC) | `bybit resolve <UUID> --action acknowledged` — `bybit weights --toggle <strategy>` if pattern is systematic |
+| `ambiguous_decision` | Read `context.composite_score` and `context.ev` | approve if score > 0.7 AND ev > 0 AND no open position on that symbol; else reject |
+
+Expired events (expiry in the past): resolve with default action — they already auto-applied.
+
+### 3. Read the performance digest
+```bash
+bybit report --period daily --json
+```
+Decision rules:
+- `bottleneck: no_signals` → `bybit tune --set confidenceFloor=0.35`
+- `bottleneck: low_approval` and top rejection is "size too small" → `bybit tune --set maxRiskPct=0.025`
+- `bottleneck: risk_gate` → read top rejection reason; lower the relevant threshold by 10%
+- `win_rate < 0.40` and `total_trades > 10` → `bybit weights --toggle <worst_strategy>`
+- `approval_rate < 0.30` → check regime distribution; if `ranging` dominates, reduce `trend_momentum` weight
+- `max_dd > 3%` → `bybit tune --set maxRiskPct=0.010`
+
+### 4. Check for code errors
+```bash
+# Read recent logs (if running as systemd)
+sudo journalctl -u bybit --since "1 hour ago" | grep -E "error|critical|warning" | tail -30
+# Or if running via nohup:
+tail -100 /var/log/bybit.log | grep -E "error|critical" | tail -30
+```
+Decision rules:
+- Repeated `error` on the same symbol → investigate. May need a code fix.
+- `critical` level → the kill switch may have fired. Check `bybit status`.
+- `warning` on `margin` or `110007` → normal if margin is fully deployed; ignore.
+- Any Python traceback → read the full traceback, fix the bug, run `pytest`, restart.
+
+### 5. Tune if the report supports it
+```bash
+bybit tune --list --json      # see current values and allowed bounds
+bybit weights --json          # see strategy allocations
+```
+Only change parameters if the last 24h+ of data supports it. Never change more than one
+parameter per session. Stay within the bounds shown by `bybit tune --list`.
+
+### 6. Confirm the loop is healthy before leaving
+```bash
+bybit status --json   # last_cycle_at should be < 2 minutes ago
+```
+If `last_cycle_at` is stale (> 5 min ago), the loop may have hung. Restart:
+```bash
+sudo systemctl restart bybit   # or: pkill -f "bybit run" && bybit run
+bybit status --json            # confirm it comes back
+```
+
+---
+
+## Scheduling Autonomous Agent Sessions
+
+The Python service runs 24/7 without the AI. The AI agent only needs to run the
+recurring session job above — typically once or twice a day, or whenever events fire.
+
+**What triggers an agent session:**
+- Pending `ambiguous_decision` events (require approval within 30 min TTL)
+- Pending `risk_escalation` events (require acknowledgement within 4h)
+- Daily `scheduled_review` (every 24h)
+- Any code error that the loop cannot self-recover from
+
+**How to automate sessions on the VPS with Claude Code CLI:**
+
+```bash
+# Run the recurring session job on a schedule (cron example — twice daily)
+# Add to crontab: crontab -e
+0 8,20 * * * cd /root/BYBiT && claude --print "Follow the Recurring Session Job in AGENT.md" 2>&1 >> /var/log/bybit-agent.log
+
+# Or trigger immediately whenever new events appear (poll loop):
+while true; do
+  EVENT_COUNT=$(bybit events --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo 0)
+  if [ "$EVENT_COUNT" -gt 0 ]; then
+    cd /root/BYBiT && claude --print "Follow the Recurring Session Job in AGENT.md. There are $EVENT_COUNT pending events."
+  fi
+  sleep 300  # check every 5 minutes
+done
+```
+
+**What the agent does each session (in plain terms):**
+1. Checks if the bot is alive and healthy
+2. Reads and resolves every pending event using the decision rules above
+3. Reads the performance report and adjusts one parameter if data supports it
+4. Scans logs for errors — if a bug is found, fixes the code, runs tests, restarts
+5. Confirms the loop is cycling before exiting
+
+The agent never places orders directly. All trading decisions go through the event queue
+or the `bybit tune` / `bybit weights` commands which feed into the next cycle.
 
 ---
 
