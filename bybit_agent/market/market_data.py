@@ -53,6 +53,7 @@ class MarketSnapshot:
     longShortRatio: float | None = None   # buyRatio from /v5/market/account-ratio (0–1; >0.5 = more longs)
     historicalVolatility: float | None = None  # from /v5/market/historical-volatility
     research: ResearchData | None = None
+    regime: str | None = None  # stamped by DecisionEngine before strategy.evaluate()
 
 
 def _f(x, default=0.0) -> float:

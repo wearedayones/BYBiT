@@ -17,6 +17,7 @@ from ..market.news import compute_sentiment_multiplier
 from ..persistence.db import get_db
 from .base import Signal, StrategyContext
 from .impl.breakout import Breakout
+from .impl.crowded_positioning import CrowdedPositioning
 from .impl.funding_harvest import FundingHarvest
 from .impl.mean_reversion import MeanReversion
 from .impl.trend_momentum import TrendMomentum
@@ -46,7 +47,7 @@ class WeightedSignal:
 
 class DecisionEngine:
     def __init__(self, paper: bool = True) -> None:
-        self._strategies = [TrendMomentum(), MeanReversion(), Breakout(), FundingHarvest()]
+        self._strategies = [TrendMomentum(), MeanReversion(), Breakout(), FundingHarvest(), CrowdedPositioning()]
         self._paper = paper
 
     @property
@@ -85,6 +86,7 @@ class DecisionEngine:
                 prior = 1.0
             learned_prior: float = prior  # type: ignore[assignment]
 
+            snap.regime = regime  # let strategies read the pre-computed regime
             signal: Signal = strategy.evaluate(snap, StrategyContext(
                 strategyWeight=weight, learnedPrior=learned_prior))
             if signal.action == "hold":

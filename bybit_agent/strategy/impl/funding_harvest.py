@@ -9,7 +9,7 @@ FUNDING_THRESHOLD_ANNUALIZED = 0.10  # 10% APR (~0.027% per 8h funding payment)
 
 class FundingHarvest:
     name = "funding_harvest"
-    suitable_regimes = ["trending", "ranging", "high_volatility", "crisis"]
+    suitable_regimes = ["trending", "ranging", "high_volatility", "crisis", "crowded_long", "crowded_short"]
 
     def evaluate(self, snap, ctx: StrategyContext) -> Signal:
         funding_rate = snap.fundingRate
