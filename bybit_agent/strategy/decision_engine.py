@@ -8,6 +8,7 @@ shadow rows (is_paper=true) until cutover.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass
 
 from ..core.logger import child_logger
@@ -56,46 +57,60 @@ class DecisionEngine:
         db = get_db()
 
         # Prefer the backtest-gated registry: only accepted+enabled strategies trade.
-        # Fall back to the hardcoded set + strategy_weights if the registry is empty
-        # (e.g. pre-migration deployments) so the loop never goes dark.
+        # Fall back to the hardcoded set + strategy_weights if the registry is empty.
         active = await self._load_active(db)
 
+        # Build every (snapshot, strategy, weight) combo and pre-compute regimes.
+        combos = [
+            (snap, strategy, weight, classify_regime(snap))
+            for snap in snapshots
+            for strategy, weight in active
+        ]
+
+        # Fetch all learned priors in parallel — these are DB round-trips so
+        # batching them cuts cycle latency by O(symbols × strategies).
+        priors = await asyncio.gather(
+            *[self._get_learned_prior(s.name, regime, snap.symbol)
+              for snap, s, _w, regime in combos],
+            return_exceptions=True,
+        )
+
         results: list[WeightedSignal] = []
-        for snap in snapshots:
-            regime = classify_regime(snap)
-            for strategy, weight in active:
-                learned_prior = await self._get_learned_prior(strategy.name, regime, snap.symbol)
-                signal: Signal = strategy.evaluate(snap, StrategyContext(
-                    strategyWeight=weight, learnedPrior=learned_prior))
-                if signal.action == "hold":
-                    continue
-                # Record under the registry instance name (may differ from base).
-                signal.strategy = strategy.name
+        for (snap, strategy, weight, regime), prior in zip(combos, priors):
+            if isinstance(prior, Exception):
+                prior = 1.0
+            learned_prior: float = prior  # type: ignore[assignment]
 
-                regime_mult = 1.0 if regime in strategy.suitable_regimes else 0.3
+            signal: Signal = strategy.evaluate(snap, StrategyContext(
+                strategyWeight=weight, learnedPrior=learned_prior))
+            if signal.action == "hold":
+                continue
+            signal.strategy = strategy.name
 
-                if signal.action in ("enter_long", "enter_short"):
-                    sentiment_mult = compute_sentiment_multiplier(snap.research, signal.action)
-                else:
-                    sentiment_mult = 1.0
-                trending_boost = 1.10 if (snap.research and snap.research.trendingRank is not None) else 1.0
+            regime_mult = 1.0 if regime in strategy.suitable_regimes else 0.3
 
-                composite = (
-                    signal.confidence * weight * regime_mult
-                    * (learned_prior * RECENCY_DECAY + (1 - RECENCY_DECAY))
-                    * sentiment_mult * trending_boost
-                )
-                if composite < CONFIDENCE_FLOOR:
-                    continue
+            if signal.action in ("enter_long", "enter_short"):
+                sentiment_mult = compute_sentiment_multiplier(snap.research, signal.action)
+            else:
+                sentiment_mult = 1.0
+            trending_boost = 1.10 if (snap.research and snap.research.trendingRank is not None) else 1.0
 
-                results.append(WeightedSignal(
-                    action=signal.action, symbol=signal.symbol, strategy=signal.strategy,
-                    confidence=signal.confidence, rationale=signal.rationale,
-                    suggestedEntry=signal.suggestedEntry, suggestedStop=signal.suggestedStop,
-                    suggestedTp=signal.suggestedTp, compositeScore=composite, weight=weight,
-                    learnedPrior=learned_prior, sentimentMultiplier=sentiment_mult,
-                    trendingBoost=trending_boost,
-                ))
+            composite = (
+                signal.confidence * weight * regime_mult
+                * (learned_prior * RECENCY_DECAY + (1 - RECENCY_DECAY))
+                * sentiment_mult * trending_boost
+            )
+            if composite < CONFIDENCE_FLOOR:
+                continue
+
+            results.append(WeightedSignal(
+                action=signal.action, symbol=signal.symbol, strategy=signal.strategy,
+                confidence=signal.confidence, rationale=signal.rationale,
+                suggestedEntry=signal.suggestedEntry, suggestedStop=signal.suggestedStop,
+                suggestedTp=signal.suggestedTp, compositeScore=composite, weight=weight,
+                learnedPrior=learned_prior, sentimentMultiplier=sentiment_mult,
+                trendingBoost=trending_boost,
+            ))
 
         results.sort(key=lambda s: s.compositeScore, reverse=True)
         await self._persist(results, snapshots, cycle_id)
@@ -158,12 +173,18 @@ class DecisionEngine:
             rows = await db.fetch(
                 """
                 SELECT win_rate, n_trades FROM learned_signals
-                WHERE strategy = $1 AND regime = $2 AND n_trades >= 10 LIMIT 1
+                WHERE strategy = $1 AND regime = $2 AND n_trades >= 3
+                ORDER BY n_trades DESC LIMIT 1
                 """,
                 strategy, regime,
             )
-            if rows and rows[0].get("win_rate"):
-                return max(0.5, float(rows[0]["win_rate"]))
+            if rows and rows[0].get("win_rate") is not None:
+                # Blend toward 0.5 (neutral) while n_trades is low to limit cold-start overfit.
+                n      = int(rows[0]["n_trades"] or 0)
+                raw    = float(rows[0]["win_rate"])
+                weight = min(1.0, n / 20)          # full trust at 20+ trades
+                blended = raw * weight + 0.55 * (1 - weight)
+                return max(0.05, min(0.95, blended))
         except Exception:  # noqa: BLE001
             pass
         return 1.0

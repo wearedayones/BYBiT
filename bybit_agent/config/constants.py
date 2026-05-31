@@ -76,6 +76,28 @@ PROMOTION_DEFAULTS = {
     "MAX_DRAWDOWN_PCT": 0.05,
 }
 
+# Symbols tradable with very small equity ($1–$50).
+# These have min order notional < $0.50 at typical prices.
+# Used by discovery when equity < MICRO_CAPITAL_EQUITY_THRESHOLD.
+MICRO_CAPITAL_SYMBOLS = [
+    "DOGEUSDT",   # min 1 DOGE ≈ $0.10–0.20
+    "SHIBUSDT",   # min 100,000 SHIB ≈ $0.10–0.30
+    "PEPEUSDT",   # min 100,000 PEPE ≈ $0.10–0.20
+    "FLOKIUSDT",  # min 100 FLOKI ≈ $0.02–0.05
+    "BONKUSDT",   # min 1,000,000 BONK ≈ $0.05–0.15
+    "WIFUSDT",    # min 0.1 WIF ≈ $0.25–0.50
+    "ADAUSDT",    # min 1 ADA ≈ $0.35–0.80
+    "XRPUSDT",    # min 1 XRP ≈ $0.40–0.70
+    "TRXUSDT",    # min 1 TRX ≈ $0.10–0.20
+    "LTCUSDT",    # min 0.01 LTC ≈ $0.60–1.00
+]
+MICRO_CAPITAL_EQUITY_THRESHOLD = 50.0   # USD — below this, use micro-capital universe
+
+LEVERAGE_DEFAULTS = {
+    "DEFAULT": 1,   # safe default (no leverage)
+    "MAX":     20,  # absolute cap enforced by sizing
+}
+
 CYCLE_INTERVAL_MS = 60_000
 INSTRUMENT_CACHE_TTL_MS = 2 * 60 * 60 * 1000
 LEADER_REVIEW_INTERVAL_MS = 4 * 60 * 60 * 1000

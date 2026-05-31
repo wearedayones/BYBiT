@@ -80,7 +80,8 @@ class RiskManager:
 
         return HardLimits(False, False, False)
 
-    def approve(self, signal, instrument: dict, circuit_breaker: bool) -> ApprovalResult:
+    def approve(self, signal, instrument: dict, circuit_breaker: bool,
+               leverage: int = 1) -> ApprovalResult:
         s = self._state()
         max_risk_pct = s.maxRiskPct * 0.5 if circuit_breaker else s.maxRiskPct
 
@@ -88,16 +89,17 @@ class RiskManager:
         if not stop:
             return ApprovalResult(False, 0, 0, reason="No stop loss provided")
 
-        min_qty = float(instrument["lotSizeFilter"]["minOrderQty"])
+        min_qty  = float(instrument["lotSizeFilter"]["minOrderQty"])
         qty_step = float(instrument["lotSizeFilter"]["qtyStep"])
-        max_qty = float(instrument["lotSizeFilter"]["maxOrderQty"])
+        max_qty  = float(instrument["lotSizeFilter"]["maxOrderQty"])
 
         sizing = compute_position_size(SizingInput(
             equity=s.equity, maxRiskPct=max_risk_pct,
             entryPrice=_get(signal, "suggestedEntry") or s.equity, stopPrice=stop,
             atr14=0, minQty=min_qty, qtyStep=qty_step, maxQty=max_qty,
+            leverage=leverage,
             maxExposurePct=0.20,
-            maxAbsoluteRiskPct=0.20,  # min-lot rescue fires up to 20% risk; matches exposure cap
+            maxAbsoluteRiskPct=0.20,
         ))
 
         if sizing.qty <= 0:

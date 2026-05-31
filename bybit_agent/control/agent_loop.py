@@ -3,23 +3,33 @@
 The loop runs paper=True (shadow decisions, no live execution) until Phase 6
 cutover. It reads agent_state.env each cycle so the transition is live-hot
 once the DB row is flipped.
+
+Self-improvement happens inside the loop:
+  • paper_positions are simulated each cycle → closed trades feed record_outcome()
+  • adaptive_weight_decay() runs every ADAPT_EVERY_CYCLES to tune strategy weights
+  • retrain_from_history() fires automatically when 50 new outcomes have accumulated
 """
 from __future__ import annotations
 
 import asyncio
 import time
 import uuid
+from datetime import datetime, timezone
 
 from bybit_agent.config.constants import (
     CYCLE_INTERVAL_MS,
+    LEVERAGE_DEFAULTS,
+    MICRO_CAPITAL_EQUITY_THRESHOLD,
+    MICRO_CAPITAL_SYMBOLS,
     REPO_POLL_INTERVAL_MS,
 )
 
 SIGNAL_DROUGHT_THRESHOLD = 60  # consecutive cycles with signals but no approval (~1 h)
+ADAPT_EVERY_CYCLES = 10        # run adaptive_weight_decay every N cycles
 from bybit_agent.core.errors import KillSwitchError
 from bybit_agent.core.logger import get_logger
 from bybit_agent.exchange.bybit_client import BybitClient
-from bybit_agent.market.market_data import MarketDataService
+from bybit_agent.market.market_data import MarketDataService, classify_regime
 from bybit_agent.market.discovery import MarketDiscovery
 from bybit_agent.strategy.decision_engine import DecisionEngine
 from bybit_agent.risk.risk_manager import RiskManager
@@ -32,10 +42,11 @@ from bybit_agent.persistence.db import NeonHttpClient
 from bybit_agent.review.self_review import SelfReview
 from bybit_agent.bots.bot_manager import BotManager
 from bybit_agent.copy.copy_manager import CopyTradingManager
+from bybit_agent.reports.telegram import send_alert
 
 log = get_logger().bind(module="agent-loop")
 
-FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+FALLBACK_SYMBOLS = MICRO_CAPITAL_SYMBOLS[:3]
 DISCOVERY_INTERVAL_MS = 5 * 60 * 1000
 
 
@@ -66,8 +77,14 @@ class AgentLoop:
         self._last_discovery = 0.0
         self._watched_symbols: list[str] = list(FALLBACK_SYMBOLS)
 
-        self._no_trade_cycles: int = 0       # consecutive cycles: signals exist but all rejected
-        self._drought_signals_seen: int = 0  # accumulated signal count across drought window
+        self._no_trade_cycles: int = 0
+        self._drought_signals_seen: int = 0
+        self._cycle_count: int = 0
+        self._leverage: int = LEVERAGE_DEFAULTS["DEFAULT"]
+
+        # In-memory paper positions: {symbol → position dict}
+        # Persisted on close to trades table; rebuilt from DB on restart.
+        self._paper_positions: dict[str, dict] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -95,6 +112,7 @@ class AgentLoop:
 
     async def _cycle(self) -> None:
         cycle_id = str(uuid.uuid4())
+        self._cycle_count += 1
 
         # ── 1. Check agent_state for manual pause/kill ─────────────────────
         rows = await self._db.fetch("SELECT * FROM agent_state WHERE id = 'singleton' LIMIT 1")
@@ -109,6 +127,9 @@ class AgentLoop:
         is_testnet = current_env == "testnet"
         self._client.set_testnet(is_testnet)
 
+        # Read configured leverage (agent can change at runtime via `bybit tune`)
+        self._leverage = await self._get_configured_leverage()
+
         # ── 2. Hard limits ──────────────────────────────────────────────────
         await self._portfolio.refresh()
         limits = await self._risk.check_hard_limits(cycle_id)
@@ -122,7 +143,7 @@ class AgentLoop:
             self._last_discovery = now_ms
             equity = self._portfolio.get_state().equity
             try:
-                symbols = await self._discovery.discover(equity)
+                symbols = await self._discovery.discover(equity, self._leverage)
                 if symbols:
                     self._watched_symbols = symbols
             except Exception as e:
@@ -139,7 +160,11 @@ class AgentLoop:
             log.warning("No market data — skipping cycle")
             return
 
-        # ── 3b. Manage open positions ───────────────────────────────────────
+        # ── 3b. Tick paper position simulation (stop/TP hits) ──────────────
+        if self._decisions.paper and self._paper_positions:
+            await self._tick_paper_positions(snapshots, cycle_id)
+
+        # ── 3c. Manage open positions ───────────────────────────────────────
         if not self._kill.is_engaged():
             try:
                 await self._position_health.tick(snapshots)
@@ -177,7 +202,7 @@ class AgentLoop:
             if not instrument:
                 continue
 
-            approval = self._risk.approve(sig, instrument, circuit_breaker)
+            approval = self._risk.approve(sig, instrument, circuit_breaker, leverage=self._leverage)
             econ = {
                 "ev": approval.ev,
                 "costPct": approval.costPct,
@@ -212,13 +237,32 @@ class AgentLoop:
                 cycle_id, sig.symbol, sig.strategy,
             )
 
-            # paper=True: DecisionEngine already wrote the shadow row. We skip live execution.
+            # paper=True: record virtual position for simulation; skip live execution.
+            if self._decisions.paper:
+                if sig.symbol not in self._paper_positions:
+                    entry_px = sig.suggestedEntry or snap.lastPrice
+                    self._paper_positions[sig.symbol] = {
+                        "symbol": sig.symbol,
+                        "side": "Buy" if sig.action == "enter_long" else "Sell",
+                        "qty": approval.qty,
+                        "entry_price": entry_px,
+                        "stop_price": approval.stopPrice,
+                        "tp_price": approval.tpPrice,
+                        "strategy": sig.strategy,
+                        "cycle_id": cycle_id,
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    log.info("Paper position opened", symbol=sig.symbol,
+                             side=self._paper_positions[sig.symbol]["side"],
+                             entry=entry_px, strategy=sig.strategy)
+
             # When paper=False (Phase 6 cutover), the block below fires.
             if not self._decisions.paper:
                 try:
                     side = "Buy" if sig.action == "enter_long" else "Sell"
                     order_link_id = f"agent-{sig.strategy}-{sig.symbol}-{int(time.time() * 1000)}"
                     ref_price = sig.suggestedEntry or snap.lastPrice
+                    await self._client.set_leverage("linear", sig.symbol, self._leverage)
                     result = await self._execution.enter(EnterParams(
                         category="linear",
                         symbol=sig.symbol,
@@ -253,6 +297,12 @@ class AgentLoop:
                     log.info("Order placed", symbol=sig.symbol, side=side,
                              qty=approval.qty, strategy=sig.strategy,
                              fill=result.fillType)
+                    asyncio.create_task(send_alert(
+                        "position_open",
+                        symbol=sig.symbol, side=side, qty=approval.qty,
+                        strategy=sig.strategy, fill=result.fillType,
+                        entry=ref_price, leverage=self._leverage,
+                    ))
                 except Exception as e:
                     log.error("Order failed", symbol=sig.symbol, error=str(e))
                     import json
@@ -328,10 +378,97 @@ class AgentLoop:
             self._last_repo_check = now
             asyncio.create_task(self._repo_check())
 
+        # ── 9b. Continuous learning ─────────────────────────────────────────
+        if self._cycle_count % ADAPT_EVERY_CYCLES == 0:
+            try:
+                from bybit_agent.ml.learner import adaptive_weight_decay
+                await adaptive_weight_decay(self._db)
+            except Exception as e:
+                log.warning("Adaptive weight decay failed", error=str(e))
+
+        try:
+            from bybit_agent.ml.learner import outcomes_since_retrain, retrain_from_history
+            if outcomes_since_retrain() >= 50:
+                asyncio.create_task(retrain_from_history(self._db))
+                log.info("Auto-retrain triggered", outcomes=outcomes_since_retrain())
+        except Exception as e:
+            log.warning("Retrain check failed", error=str(e))
+
         # ── 10. Update agent_state ──────────────────────────────────────────
         await self._db.execute(
             "UPDATE agent_state SET last_cycle_at = now(), updated_at = now() WHERE id = 'singleton'"
         )
+
+    async def _get_configured_leverage(self) -> int:
+        try:
+            rows = await self._db.fetch(
+                "SELECT value FROM agent_config WHERE key = 'default_leverage' LIMIT 1"
+            )
+            if rows and rows[0].get("value") is not None:
+                v = int(rows[0]["value"])
+                return max(1, min(LEVERAGE_DEFAULTS["MAX"], v))
+        except Exception:
+            pass
+        return LEVERAGE_DEFAULTS["DEFAULT"]
+
+    async def _tick_paper_positions(self, snapshots, cycle_id: str) -> None:
+        """Check each paper position against current prices; close on stop/TP hit."""
+        by_symbol = {s.symbol: s for s in snapshots}
+        to_close: list[str] = []
+
+        for sym, pos in self._paper_positions.items():
+            snap = by_symbol.get(sym)
+            if not snap:
+                continue
+            px = snap.lastPrice
+            side = pos["side"]
+            stop = pos.get("stop_price")
+            tp = pos.get("tp_price")
+
+            hit_stop = stop and (
+                (side == "Buy" and px <= stop) or
+                (side == "Sell" and px >= stop)
+            )
+            hit_tp = tp and (
+                (side == "Buy" and px >= tp) or
+                (side == "Sell" and px <= tp)
+            )
+
+            if hit_stop or hit_tp:
+                exit_px = stop if hit_stop else tp
+                pnl_pct = (exit_px - pos["entry_price"]) / pos["entry_price"]
+                if side == "Sell":
+                    pnl_pct = -pnl_pct
+                pnl_abs = pnl_pct * pos["qty"] * pos["entry_price"]
+                reason = "stop" if hit_stop else "tp"
+
+                try:
+                    import json as _json
+                    regime = classify_regime(snap)
+                    await self._db.execute(
+                        """INSERT INTO trades
+                             (decision_id, symbol, side, qty, entry_price, exit_price,
+                              pnl, pnl_pct, close_reason, strategy, is_paper)
+                           SELECT id, $1, $2, $3, $4, $5, $6, $7, $8, $9, true
+                           FROM decision_log
+                           WHERE cycle_id = $10::uuid AND symbol = $1
+                           LIMIT 1""",
+                        sym, side, pos["qty"], pos["entry_price"], exit_px,
+                        pnl_abs, pnl_pct, reason, pos["strategy"], pos["cycle_id"],
+                    )
+                    from bybit_agent.ml.learner import record_outcome
+                    await record_outcome(
+                        self._db, pos["strategy"], regime, sym, pnl_abs, is_paper=True
+                    )
+                except Exception as e:
+                    log.warning("Paper trade close failed", symbol=sym, error=str(e))
+
+                log.info("Paper position closed", symbol=sym, reason=reason,
+                         entry=pos["entry_price"], exit=exit_px, pnl=round(pnl_abs, 4))
+                to_close.append(sym)
+
+        for sym in to_close:
+            self._paper_positions.pop(sym, None)
 
     def _adaptive_interval(self) -> float:
         state = self._portfolio.get_state()

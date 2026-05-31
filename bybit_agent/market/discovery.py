@@ -51,7 +51,7 @@ class MarketDiscovery:
         self._instruments: dict[str, dict] = {}
         self._last_instrument_fetch = 0
 
-    async def discover(self, equity: float) -> list[str]:
+    async def discover(self, equity: float, leverage: int = 1) -> list[str]:
         try:
             tickers = await self._client.get_tickers("linear")
             await self._refresh_instruments()
@@ -63,7 +63,7 @@ class MarketDiscovery:
                     continue
                 if inst.get("quoteCoin") != "USDT":
                     continue
-                m = self._score_market(t, inst, equity)
+                m = self._score_market(t, inst, equity, leverage)
                 if m:
                     scored.append(m)
 
@@ -71,8 +71,8 @@ class MarketDiscovery:
                               key=lambda m: m.score, reverse=True)[:self._cfg.maxSymbols]
 
             if not tradable:
-                log.warning("No affordable markets found — falling back to majors", equity=equity)
-                return self._fallback()
+                log.warning("No affordable markets found — falling back", equity=equity)
+                return self._fallback(equity)
 
             await self._persist(tradable, equity)
             symbols = [m.symbol for m in tradable]
@@ -80,13 +80,14 @@ class MarketDiscovery:
             return symbols
         except Exception as e:  # noqa: BLE001
             log.error("Discovery failed — using fallback symbols", error=str(e))
-            return self._fallback()
+            return self._fallback(equity)
 
-    def _score_market(self, t: dict, inst: dict, equity: float) -> ScoredMarket | None:
-        price = _f(t.get("lastPrice"))
-        turnover = _f(t.get("turnover24h"))
+    def _score_market(self, t: dict, inst: dict, equity: float,
+                      leverage: int = 1) -> ScoredMarket | None:
+        price     = _f(t.get("lastPrice"))
+        turnover  = _f(t.get("turnover24h"))
         volatility = abs(_f(t.get("price24hPcnt")))
-        min_qty = _f(inst["lotSizeFilter"]["minOrderQty"])
+        min_qty   = _f(inst["lotSizeFilter"]["minOrderQty"])
         if not (price > 0) or not (min_qty > 0):
             return None
 
@@ -98,7 +99,10 @@ class MarketDiscovery:
         if volatility > self._cfg.maxVolatility:
             return None
 
-        required_margin = min_notional / self._cfg.affordabilityLeverage
+        # Effective leverage for affordability: whichever is larger — configured
+        # account leverage or the discovery config's affordability leverage.
+        eff_lev = max(leverage, self._cfg.affordabilityLeverage)
+        required_margin = min_notional / eff_lev
         affordable = equity > 0 and required_margin <= equity * self._cfg.maxMarginFraction
 
         liquidity_score = math.log10(turnover + 1) / 10
@@ -132,7 +136,14 @@ class MarketDiscovery:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _fallback(self) -> list[str]:
+    def _fallback(self, equity: float = 0.0) -> list[str]:
+        from bybit_agent.config.constants import (
+            MICRO_CAPITAL_EQUITY_THRESHOLD,
+            MICRO_CAPITAL_SYMBOLS,
+        )
+        if 0 < equity < MICRO_CAPITAL_EQUITY_THRESHOLD:
+            log.info("Using micro-capital fallback symbols", equity=equity)
+            return MICRO_CAPITAL_SYMBOLS[:self._cfg.maxSymbols]
         return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 

@@ -75,6 +75,11 @@ PARAM_WHITELIST: dict[str, ParamSpec] = {
         "desc": "Notional (USDT) above which TWAP routing is used instead of a single market order (100–10000)",
         "db_key": "algo_threshold_usdt",
     },
+    "defaultLeverage": {
+        "min": 1, "max": 20, "type": "int",
+        "desc": "Exchange leverage applied to all new positions (1 = no leverage, max 20)",
+        "db_key": "default_leverage",
+    },
 }
 
 STRATEGY_NAMES = ["trend_momentum", "mean_reversion", "breakout", "funding_harvest"]

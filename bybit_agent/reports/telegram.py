@@ -23,6 +23,32 @@ def telegram_enabled() -> bool:
     return bool(os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"))
 
 
+_ALERT_ICONS: dict[str, str] = {
+    "kill":         "🔴",
+    "position_open":  "✅",
+    "position_close": "📊",
+    "drawdown":     "🟠",
+    "drought":      "🟡",
+    "error":        "❌",
+    "info":         "ℹ️",
+}
+
+
+async def send_alert(event: str, **kwargs) -> bool:
+    """Send a structured real-time alert for a trading event.
+
+    event: one of 'kill', 'position_open', 'position_close', 'drawdown',
+           'drought', 'error', 'info' — or any free-form string.
+    kwargs: key=value pairs shown as code lines in the message.
+    """
+    icon  = _ALERT_ICONS.get(event, "🔔")
+    label = event.replace("_", " ").upper()
+    lines = [f"{icon} <b>{label}</b>"]
+    for k, v in kwargs.items():
+        lines.append(f"  {k}: <code>{v}</code>")
+    return await send_telegram("\n".join(lines))
+
+
 async def send_telegram(text: str) -> bool:
     """Send a message to the configured chat. No-op when Telegram isn't configured."""
     if not telegram_enabled():

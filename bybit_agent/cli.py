@@ -1590,5 +1590,167 @@ def skill_refresh(as_json: Annotated[bool, typer.Option("--json")] = False) -> N
             typer.echo(f"   {e}")
 
 
+@app.command()
+def pl(
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show real-time P&L for all open positions (live and paper)."""
+
+    async def _run() -> None:
+        from .config.env import get_env
+        from .exchange.bybit_client import BybitClient
+        from .exchange.credentials import resolve_bybit_auth
+
+        env = get_env()
+        auth = resolve_bybit_auth(env)
+        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        try:
+            pos_list = await client.get_positions("linear")
+            open_pos = [p for p in pos_list if float(p.get("size", 0)) > 0]
+        finally:
+            await client.aclose()
+
+        db = await _get_db()
+        paper_rows = await db.fetch(
+            "SELECT symbol, side, qty, entry_price, stop_price, tp_price, strategy, leverage "
+            "FROM paper_positions ORDER BY symbol"
+        ) if db else []
+
+        total_upnl = 0.0
+        rows_out = []
+
+        for p in open_pos:
+            upnl = float(p.get("unrealisedPnl") or 0)
+            total_upnl += upnl
+            rows_out.append({
+                "symbol": p["symbol"], "side": p["side"],
+                "qty": p.get("size"), "entry": p.get("avgPrice"),
+                "mark": p.get("markPrice"), "uPnL": upnl,
+                "sl": p.get("stopLoss"), "tp": p.get("takeProfit"),
+                "mode": "live",
+            })
+
+        for r in paper_rows:
+            rows_out.append({
+                "symbol": r["symbol"], "side": r["side"],
+                "qty": r["qty"], "entry": r["entry_price"],
+                "mark": "—", "uPnL": 0.0,
+                "sl": r.get("stop_price"), "tp": r.get("tp_price"),
+                "mode": "paper",
+            })
+
+        if as_json:
+            _print_json({"positions": rows_out, "total_uPnL": total_upnl})
+            return
+
+        if not rows_out:
+            typer.echo("No open positions.")
+            return
+        typer.echo(f"{'Symbol':12s}  {'Side':4s}  {'Mode':5s}  {'Qty':>10s}  {'Entry':>10s}"
+                   f"  {'Mark':>10s}  {'uPnL':>10s}  {'SL':>10s}  {'TP':>10s}")
+        typer.echo("─" * 110)
+        for p in rows_out:
+            upnl = p["uPnL"]
+            sign = "+" if upnl >= 0 else ""
+            typer.echo(
+                f"{p['symbol']:12s}  {p['side']:4s}  {p['mode']:5s}  {str(p['qty'] or ''):>10s}"
+                f"  {str(p['entry'] or ''):>10s}  {str(p['mark']):>10s}"
+                f"  {sign}{upnl:.4f}  {str(p['sl'] or ''):>10s}  {str(p['tp'] or ''):>10s}"
+            )
+        typer.echo("─" * 110)
+        typer.echo(f"Total unrealised P&L (live): {'+' if total_upnl >= 0 else ''}{total_upnl:.4f}")
+
+    asyncio.run(_run())
+
+
+@app.command()
+def signal(
+    symbol: Annotated[str, typer.Argument(help="e.g. BTCUSDT")],
+    category: Annotated[str, typer.Option("--category")] = "linear",
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Run the full signal pipeline for one symbol and print decisions (no execution)."""
+
+    async def _run() -> None:
+        import uuid as _uuid
+        from .config.env import get_env
+        from .exchange.bybit_client import BybitClient
+        from .exchange.credentials import resolve_bybit_auth
+        from .market.market_data import MarketDataService
+        from .strategy.decision_engine import DecisionEngine
+
+        env = get_env()
+        auth = resolve_bybit_auth(env)
+        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        try:
+            svc = MarketDataService(client)
+            snap = await svc.get_snapshot(symbol.upper(), category)
+        finally:
+            await client.aclose()
+
+        if not snap:
+            typer.echo(f"❌ No market data for {symbol}", err=True)
+            raise typer.Exit(1)
+
+        engine = DecisionEngine(paper=True)
+        cycle_id = str(_uuid.uuid4())
+        signals = await engine.run([snap], cycle_id)
+
+        if as_json:
+            _print_json([
+                {
+                    "symbol": s.symbol,
+                    "action": s.action,
+                    "strategy": s.strategy,
+                    "confidence": s.confidence,
+                    "compositeScore": s.compositeScore,
+                    "rationale": s.rationale,
+                    "suggestedEntry": s.suggestedEntry,
+                    "suggestedStop": s.suggestedStop,
+                    "suggestedTp": s.suggestedTp,
+                }
+                for s in signals
+            ])
+            return
+
+        if not signals:
+            typer.echo(f"No actionable signals for {symbol} (all below confidence floor).")
+            return
+        for s in signals:
+            typer.echo(
+                f"[{s.strategy}]  {s.action}  confidence={s.confidence:.3f}"
+                f"  score={s.compositeScore:.3f}"
+                f"  entry={s.suggestedEntry}  sl={s.suggestedStop}  tp={s.suggestedTp}"
+            )
+            typer.echo(f"  rationale: {s.rationale}")
+
+    asyncio.run(_run())
+
+
+@app.command()
+def train(
+    window: Annotated[int, typer.Option("--window", help="Days of history to train on")] = 30,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Trigger a full batch retrain of learned_signals from trade history."""
+
+    async def _run() -> None:
+        from .ml.learner import retrain_from_history
+        db = await _get_db()
+        if not db:
+            typer.echo("❌ DB unavailable", err=True)
+            raise typer.Exit(1)
+        result = await retrain_from_history(db, window_days=window)
+        if as_json:
+            _print_json(result)
+            return
+        typer.echo(f"✅ Retrain complete: {result['updated']} signal groups updated"
+                   f" from {result['total_trades']} trades ({window}d window)")
+        if result.get("error"):
+            typer.echo(f"⚠️  Error: {result['error']}", err=True)
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     app()
