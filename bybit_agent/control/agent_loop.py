@@ -26,6 +26,8 @@ from bybit_agent.config.constants import (
 
 SIGNAL_DROUGHT_THRESHOLD = 60        # consecutive cycles with signals but no approval (~1 h)
 ADAPT_EVERY_CYCLES = 10              # run adaptive_weight_decay every N cycles
+MARGIN_FAIL_THRESHOLD = 3            # consecutive 110007s before cooldown
+MARGIN_COOLDOWN_CYCLES = 20          # skip symbol for ~20 cycles after threshold hit
 BRAIN_RENDER_INTERVAL_MS  = 30 * 60 * 1_000        # re-render brain.md every 30 min
 PRUNE_INTERVAL_MS         = 7 * 24 * 60 * 60 * 1_000  # prune DB once per week
 from bybit_agent.core.errors import KillSwitchError
@@ -95,6 +97,11 @@ class AgentLoop:
         # Live position tracking: {symbol → {side, qty, entry_price, strategy, cycle_id, opened_at}}
         # Populated on successful order placement; used to detect closed positions each cycle.
         self._live_positions: dict[str, dict] = {}
+
+        # Per-symbol order cooldown after 110007 (insufficient margin).
+        # {symbol → cycle_number_when_cooldown_expires}
+        self._margin_cooldown: dict[str, int] = {}
+        self._margin_fail_count: dict[str, int] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -239,6 +246,14 @@ class AgentLoop:
                 break
             if self._portfolio.has_open_position(sig.symbol):
                 log.debug("Skipping entry — position already open", symbol=sig.symbol)
+                continue
+
+            # Skip symbols in margin cooldown (repeated 110007 failures).
+            cooldown_until = self._margin_cooldown.get(sig.symbol, 0)
+            if self._cycle_count < cooldown_until:
+                log.debug("Skipping entry — margin cooldown active",
+                          symbol=sig.symbol,
+                          resumes_at_cycle=cooldown_until)
                 continue
 
             snap = next((s for s in snapshots if s.symbol == sig.symbol), None)
@@ -392,6 +407,9 @@ class AgentLoop:
                         "cycle_id": cycle_id,
                         "opened_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    # Order succeeded — reset any margin failure counter.
+                    self._margin_fail_count.pop(sig.symbol, None)
+                    self._margin_cooldown.pop(sig.symbol, None)
                     log.info("Order placed", symbol=sig.symbol, side=side,
                              qty=approval.qty, strategy=sig.strategy,
                              fill=result.fillType)
@@ -402,7 +420,21 @@ class AgentLoop:
                         entry=ref_price, leverage=self._leverage,
                     ))
                 except Exception as e:
-                    log.error("Order failed", symbol=sig.symbol, error=str(e))
+                    # 110007 = insufficient margin. Count consecutive failures; after
+                    # MARGIN_FAIL_THRESHOLD hits, silence the symbol for MARGIN_COOLDOWN_CYCLES.
+                    if "110007" in str(e):
+                        count = self._margin_fail_count.get(sig.symbol, 0) + 1
+                        self._margin_fail_count[sig.symbol] = count
+                        if count >= MARGIN_FAIL_THRESHOLD:
+                            self._margin_cooldown[sig.symbol] = self._cycle_count + MARGIN_COOLDOWN_CYCLES
+                            self._margin_fail_count[sig.symbol] = 0
+                            log.warning("Margin cooldown engaged — skipping symbol for next cycles",
+                                        symbol=sig.symbol, cycles=MARGIN_COOLDOWN_CYCLES)
+                        else:
+                            log.debug("Insufficient margin", symbol=sig.symbol,
+                                      consecutive_failures=count)
+                    else:
+                        log.error("Order failed", symbol=sig.symbol, error=str(e))
                     import json
                     await self._db.execute(
                         """UPDATE decision_log
