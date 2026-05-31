@@ -148,6 +148,7 @@ class Doctor:
         report.findings.append(self._check_drawdown(snap, ag))
         report.findings.append(await self._check_signal_flow())
         report.findings.append(await self._check_event_backlog())
+        report.findings.append(await self._check_skill_freshness())
 
         return report
 
@@ -346,9 +347,54 @@ class Doctor:
             return Finding("event_backlog", "info", f"{n} pending event(s) awaiting the agent.")
         return Finding("event_backlog", "ok", "No pending events.")
 
+    async def _check_skill_freshness(self) -> Finding:
+        """Check whether the embedded official Bybit skill is up to date.
+
+        Checks GitHub once per 24 h (module-level cache). Auto-refreshable
+        for patch/minor bumps; escalates major bumps to the agent.
+        """
+        try:
+            from bybit_agent.skill.version_checker import check as _vc
+            info = await _vc()
+        except Exception as exc:  # noqa: BLE001
+            return Finding("skill_freshness", "info",
+                           f"Skill version check skipped: {exc}")
+
+        embedded, latest, bump = info["embedded"], info["latest"], info["bump"]
+
+        if bump == "current":
+            return Finding("skill_freshness", "ok",
+                           f"Official Bybit skill v{embedded} is current.")
+        if bump == "unknown" or latest is None:
+            return Finding("skill_freshness", "info",
+                           f"Embedded skill v{embedded} — latest version unavailable (network).")
+        if bump in ("patch", "minor"):
+            return Finding(
+                "skill_freshness", "info",
+                f"Official skill update available: v{embedded} → v{latest} ({bump}). Auto-refreshing.",
+                recommendation=f"bybit skill refresh",
+            )
+        # Major bump — requires agent review.
+        return Finding(
+            "skill_freshness", "warn",
+            f"Official skill MAJOR update: v{embedded} → v{latest}. "
+            "Breaking changes may affect API reference. Review before applying.",
+            recommendation=(
+                f"Check what changed with `bybit skill show <module>`, then run "
+                f"`bybit skill refresh` when ready to update."
+            ),
+        )
+
     # ── treatment (mutations + escalations) ──────────────────────────────────────
 
     async def _treat_one(self, f: Finding) -> None:
+        # Skill auto-refresh runs before the info-skip so patch/minor bumps are fixed
+        # even though they carry severity='info' (they're not a health risk, just stale).
+        if f.check == "skill_freshness" and f.severity == "info" and not f.auto_fixed:
+            if "Auto-refreshing" in f.detail:
+                await self._auto_refresh_skill(f)
+                return
+
         if f.severity == "ok" or f.severity == "info":
             return
 
@@ -372,6 +418,25 @@ class Doctor:
 
         # 2. Escalate judgment calls to the agent (deduplicated).
         await self._escalate(f)
+
+    async def _auto_refresh_skill(self, f: Finding) -> None:
+        """Pull latest official skill modules from GitHub (patch/minor bump only)."""
+        try:
+            from bybit_agent.skill.version_checker import refresh as _refresh, check as _vc
+            info = await _vc()
+            result = await _refresh(info.get("latest"))
+            new_ver = result.get("version", "?")
+            n = len(result.get("updated", []))
+            errs = result.get("errors", [])
+            if errs:
+                f.fix_action = f"Partial refresh to v{new_ver}: {n} modules OK, {len(errs)} failed: {errs[:2]}"
+            else:
+                f.fix_action = f"Auto-refreshed official skill to v{new_ver} ({n} modules updated)."
+            f.auto_fixed = True
+            log.info("Doctor auto-fix: refreshed official skill", version=new_ver, modules=n)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Doctor skill auto-refresh failed", error=str(exc))
+            f.recommendation = f"Auto-refresh failed ({exc}). Run `bybit skill refresh` manually."
 
     async def _escalate(self, f: Finding) -> None:
         from bybit_agent.events.triggers import trigger_signal_drought
@@ -403,6 +468,32 @@ class Doctor:
                 f.escalated = eid is not None
             except Exception as exc:  # noqa: BLE001
                 log.warning("Doctor signal_flow escalation failed", error=str(exc))
+            return
+
+        # Skill major-update: market_event so the agent can review before refreshing.
+        if f.check == "skill_freshness":
+            eid = await enqueue(
+                self._db,
+                kind="market_event",
+                severity="warning",
+                title=f"Official Bybit skill update: {f.detail[:80]}",
+                summary=(
+                    f"{f.detail}\n\n"
+                    "A major version bump may introduce new endpoints, changed parameter names, "
+                    "or deprecated functionality. Review the affected modules before refreshing.\n\n"
+                    f"Recommended: {f.recommendation}"
+                ),
+                default_action="hold",
+                context={"check": "skill_freshness", "detail": f.detail, "source": "doctor"},
+                options=[
+                    {"action": "approve",  "label": "Approve — run `bybit skill refresh` now"},
+                    {"action": "hold",     "label": "Hold — I will review and refresh manually"},
+                    {"action": "skip",     "label": "Skip — keep current version for now"},
+                ],
+                dedupe_key="doctor:skill_major_update",
+                ttl=timedelta(hours=72),
+            )
+            f.escalated = eid is not None
             return
 
         # Generic escalation: one risk_escalation event per check per 4h window.

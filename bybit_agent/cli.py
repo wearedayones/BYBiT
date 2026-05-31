@@ -119,6 +119,28 @@ async def _doctor() -> bool:
     finally:
         await close_db()
 
+    # Skill version check — always shown so any agent knows immediately.
+    try:
+        from .skill.version_checker import check as _vc, refresh as _vr
+        info = await _vc()
+        embedded, latest, bump = info["embedded"], info.get("latest"), info["bump"]
+        if bump == "current":
+            check("official skill", True, f"v{embedded} — up to date")
+        elif bump in ("patch", "minor") and latest:
+            typer.echo(f"  🔄 official skill: v{embedded} → v{latest} ({bump}) — auto-refreshing...")
+            result = await _vr(latest)
+            new_ver = result.get("version", latest)
+            errs = result.get("errors", [])
+            check("official skill", not errs,
+                  f"refreshed to v{new_ver}" + (f" ({len(errs)} errors)" if errs else ""))
+        elif bump == "major" and latest:
+            check("official skill", False,
+                  f"MAJOR update v{embedded} → v{latest} — run `bybit skill refresh` after reviewing changes")
+        else:
+            check("official skill", True, f"v{embedded} (latest version unavailable offline)")
+    except Exception as exc:  # noqa: BLE001
+        check("official skill", True, f"version check skipped ({exc})")
+
     return ok
 
 
@@ -626,13 +648,20 @@ def decide(
             if not row:
                 typer.echo(f"Event {event_id} not found.", err=True)
                 sys.exit(1)
-            if row["kind"] != "ambiguous_decision":
-                typer.echo(f"Event is kind='{row['kind']}', not 'ambiguous_decision'. Use `bybit resolve`.")
+            if row["kind"] not in ("ambiguous_decision", "market_event"):
+                typer.echo(f"Event is kind='{row['kind']}'. Use `bybit resolve` for other kinds.")
                 sys.exit(1)
             extra: dict[str, str] = {}
             for kv in (param or []):
                 k, _, v = kv.partition("=")
                 extra[k.strip()] = v.strip()
+            # Skill major-update: 'approve' triggers an immediate refresh.
+            ctx = row.get("context") or {}
+            if ctx.get("check") == "skill_freshness" and action == "approve":
+                typer.echo("Running `bybit skill refresh`...")
+                from .skill.version_checker import refresh as _vr
+                result = await _vr()
+                typer.echo(f"✅ Refreshed to v{result['version']} ({len(result['updated'])} modules)")
             await resolve_event(db, event_id, action=action, params=extra)
         finally:
             from .persistence.db import close_db
@@ -1521,65 +1550,36 @@ def skill_show(
 
 @skill_app.command("version")
 def skill_version(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
-    """Print the embedded skill version."""
-    version = (_SKILLS_DIR / "VERSION").read_text().strip() if (_SKILLS_DIR / "VERSION").exists() else "unknown"
+    """Show embedded skill version and check GitHub for the latest release."""
+    from .skill.version_checker import check as _vc
+
+    info = asyncio.run(_vc())
     if as_json:
-        _print_json({"embedded_version": version})
-    else:
-        typer.echo(f"Embedded official skill version: {version}")
+        _print_json(info)
+        return
+    embedded = info["embedded"]
+    latest = info.get("latest") or "unavailable"
+    bump = info["bump"]
+    status = {
+        "current":  "✅ up to date",
+        "patch":    f"🔄 patch update → v{latest}",
+        "minor":    f"🔄 minor update → v{latest}",
+        "major":    f"⚠️  MAJOR update → v{latest} (review before refreshing)",
+        "unknown":  "❓ latest version unavailable (network)",
+    }.get(bump, bump)
+    typer.echo(f"Embedded:  v{embedded}")
+    typer.echo(f"Latest:    v{latest}")
+    typer.echo(f"Status:    {status}")
+    if bump in ("patch", "minor"):
+        typer.echo("Run `bybit skill refresh` to update.")
 
 
 @skill_app.command("refresh")
 def skill_refresh(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
     """Fetch latest official Bybit skill modules from GitHub and update skills/."""
-    import hashlib
+    from .skill.version_checker import refresh as _vr
 
-    BASE = "https://raw.githubusercontent.com/bybit-exchange/skills/main"
-    MODULE_FILES = list(_MODULE_DESCRIPTIONS.keys())
-
-    async def _run() -> dict:
-        import httpx
-        updated: list[str] = []
-        errors: list[str] = []
-
-        async with httpx.AsyncClient(timeout=30.0) as c:
-            # Fetch VERSION first to see what we're pulling.
-            try:
-                ver_resp = await c.get(f"{BASE}/VERSION")
-                ver_resp.raise_for_status()
-                new_version = ver_resp.text.strip()
-            except Exception as e:
-                new_version = "unknown"
-                errors.append(f"VERSION: {e}")
-
-            # Fetch each module.
-            for mod in MODULE_FILES:
-                url = f"{BASE}/modules/{mod}.md"
-                try:
-                    r = await c.get(url)
-                    r.raise_for_status()
-                    dest = _MODULES_DIR / f"{mod}.md"
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(r.content)
-                    updated.append(mod)
-                except Exception as e:
-                    errors.append(f"{mod}: {e}")
-
-        if new_version != "unknown":
-            (_SKILLS_DIR / "VERSION").write_text(new_version + "\n")
-
-        # Rebuild MANIFEST (SHA256 of each module).
-        manifest_lines = []
-        for mod in MODULE_FILES:
-            p = _MODULES_DIR / f"{mod}.md"
-            if p.exists():
-                h = hashlib.sha256(p.read_bytes()).hexdigest()
-                manifest_lines.append(f"{h}  modules/{mod}.md")
-        (_SKILLS_DIR / "MANIFEST").write_text("\n".join(manifest_lines) + "\n")
-
-        return {"version": new_version, "updated": updated, "errors": errors}
-
-    result = asyncio.run(_run())
+    result = asyncio.run(_vr())
     if as_json:
         _print_json(result)
         return
