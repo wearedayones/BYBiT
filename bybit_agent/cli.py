@@ -333,7 +333,7 @@ def report(
                     f"""SELECT reject_reason, COUNT(*)::int AS count
                         FROM decision_log
                         WHERE approved = false
-                          AND outcome != 'paper'
+                          AND outcome IS DISTINCT FROM 'paper'
                           AND reject_reason IS NOT NULL
                           AND ts > now() - INTERVAL '{interval}'
                         GROUP BY reject_reason

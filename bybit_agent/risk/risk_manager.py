@@ -95,7 +95,9 @@ class RiskManager:
         sizing = compute_position_size(SizingInput(
             equity=s.equity, maxRiskPct=max_risk_pct,
             entryPrice=_get(signal, "suggestedEntry") or s.equity, stopPrice=stop,
-            atr14=0, minQty=min_qty, qtyStep=qty_step, maxQty=max_qty, maxExposurePct=0.20,
+            atr14=0, minQty=min_qty, qtyStep=qty_step, maxQty=max_qty,
+            maxExposurePct=0.20,
+            maxAbsoluteRiskPct=0.20,  # min-lot rescue fires up to 20% risk; matches exposure cap
         ))
 
         if sizing.qty <= 0:
