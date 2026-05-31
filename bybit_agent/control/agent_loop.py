@@ -90,9 +90,19 @@ class AgentLoop:
         # Persisted on close to trades table; rebuilt from DB on restart.
         self._paper_positions: dict[str, dict] = {}
 
+        # Live position tracking: {symbol → {side, qty, entry_price, strategy, cycle_id, opened_at}}
+        # Populated on successful order placement; used to detect closed positions each cycle.
+        self._live_positions: dict[str, dict] = {}
+
     async def start(self) -> None:
         self._running = True
         log.info("Agent loop starting", testnet=self._is_testnet)
+
+        # Rebuild live position tracking from exchange + orders table on restart.
+        try:
+            await self._rebuild_live_positions()
+        except Exception as e:
+            log.warning("Live position rebuild failed (non-fatal)", error=str(e))
 
         # Check for manual kill in DB on startup.
         rows = await self._db.fetch("SELECT kill_engaged FROM agent_state WHERE id = 'singleton' LIMIT 1")
@@ -172,6 +182,10 @@ class AgentLoop:
         # ── 3b. Tick paper position simulation (stop/TP hits) ──────────────
         if self._decisions.paper and self._paper_positions:
             await self._tick_paper_positions(snapshots, cycle_id)
+
+        # ── 3b-live. Reconcile live positions (detect closes, write trades) ─
+        if not self._decisions.paper and self._live_positions:
+            asyncio.create_task(self._reconcile_live_positions())
 
         # ── 3c. Manage open positions ───────────────────────────────────────
         if not self._kill.is_engaged():
@@ -341,6 +355,15 @@ class AgentLoop:
                            WHERE cycle_id = $2::uuid AND symbol = $3 AND strategy = $4""",
                         json.dumps(econ), cycle_id, sig.symbol, sig.strategy,
                     )
+                    # Track entry for live position reconciliation.
+                    self._live_positions[sig.symbol] = {
+                        "side": side,
+                        "qty": approval.qty,
+                        "entry_price": ref_price,
+                        "strategy": sig.strategy,
+                        "cycle_id": cycle_id,
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                    }
                     log.info("Order placed", symbol=sig.symbol, side=side,
                              qty=approval.qty, strategy=sig.strategy,
                              fill=result.fillType)
@@ -483,6 +506,60 @@ class AgentLoop:
             pass
         return LEVERAGE_DEFAULTS["DEFAULT"]
 
+    async def _rebuild_live_positions(self) -> None:
+        """Rebuild _live_positions from exchange data on startup.
+
+        Fetches current open positions from the exchange and matches them to recent
+        orders in the DB so we can reconcile closures even after a restart.
+        """
+        mode = await self._get_trading_mode()
+        if mode == "shadow":
+            return
+        is_testnet = (mode != "mainnet_live")
+        self._client.set_testnet(is_testnet)
+        try:
+            open_pos = await self._client.get_positions("linear")
+        except Exception:
+            return
+
+        if not open_pos:
+            return
+
+        # Fetch recent orders so we can match strategy name.
+        try:
+            order_rows = await self._db.fetch(
+                """SELECT o.symbol, o.side, o.qty, o.price, d.strategy, d.cycle_id, o.created_at
+                   FROM orders o
+                   JOIN decision_log d ON d.id = o.decision_id
+                   WHERE o.is_paper = false AND o.created_at > now() - INTERVAL '7 days'
+                   ORDER BY o.created_at DESC"""
+            )
+            order_map: dict[str, dict] = {}
+            for row in order_rows:
+                sym = row.get("symbol") or ""
+                if sym and sym not in order_map:
+                    order_map[sym] = row
+        except Exception:
+            order_map = {}
+
+        for pos in open_pos:
+            sym = pos.get("symbol") or ""
+            size = float(pos.get("size") or 0)
+            if not sym or size == 0:
+                continue
+            order_row = order_map.get(sym, {})
+            self._live_positions[sym] = {
+                "side": pos.get("side") or order_row.get("side") or "Buy",
+                "qty": size,
+                "entry_price": float(pos.get("avgPrice") or order_row.get("price") or 0),
+                "strategy": order_row.get("strategy") or "unknown",
+                "cycle_id": str(order_row.get("cycle_id") or ""),
+                "opened_at": str(pos.get("createdTime") or order_row.get("created_at") or ""),
+            }
+
+        if self._live_positions:
+            log.info("Live positions rebuilt on startup", symbols=list(self._live_positions))
+
     async def _tick_paper_positions(self, snapshots, cycle_id: str) -> None:
         """Check each paper position against current prices; close on stop/TP hit."""
         by_symbol = {s.symbol: s for s in snapshots}
@@ -552,6 +629,70 @@ class AgentLoop:
 
         for sym in to_close:
             self._paper_positions.pop(sym, None)
+
+    async def _reconcile_live_positions(self) -> None:
+        """Detect live positions that closed on the exchange and record them in trades."""
+        try:
+            open_pos = await self._client.get_positions("linear")
+            open_symbols = {p["symbol"] for p in open_pos if float(p.get("size") or 0) > 0}
+        except Exception as e:
+            log.warning("reconcile: failed to fetch positions", error=str(e))
+            return
+
+        closed = [sym for sym in list(self._live_positions) if sym not in open_symbols]
+        if not closed:
+            return
+
+        for sym in closed:
+            pos = self._live_positions.pop(sym, None)
+            if not pos:
+                continue
+            try:
+                # Fetch recent executions to find the closing fill price.
+                executions = await self._client.get_executions("linear", sym, limit=10)
+                # Most recent execution for this symbol is the close fill.
+                close_price = pos["entry_price"]  # fallback
+                close_fee = 0.0
+                if executions:
+                    ex = executions[0]
+                    close_price = float(ex.get("execPrice") or pos["entry_price"])
+                    close_fee = float(ex.get("execFee") or 0)
+
+                side = pos["side"]
+                qty = float(pos["qty"])
+                entry = float(pos["entry_price"])
+                pnl_raw = (close_price - entry) * qty if side == "Buy" else (entry - close_price) * qty
+                realized_pnl = pnl_raw - close_fee
+
+                import json as _json
+                await self._db.execute(
+                    """INSERT INTO trades
+                         (decision_id, symbol, category, side, qty, entry_price,
+                          exit_price, realized_pnl, strategy, is_paper,
+                          opened_at, closed_at, meta)
+                       SELECT id, $1, 'linear', $2, $3, $4, $5, $6, $7, false,
+                              $8::timestamptz, now(), $9::jsonb
+                       FROM decision_log
+                       WHERE cycle_id = $10::uuid AND symbol = $1 AND strategy = $7
+                       LIMIT 1
+                       ON CONFLICT DO NOTHING""",
+                    sym, side, qty, entry, close_price, realized_pnl,
+                    pos["strategy"], pos["opened_at"],
+                    _json.dumps({"close_fee": close_fee, "reconciled": True}),
+                    pos["cycle_id"],
+                )
+                from bybit_agent.ml.learner import record_outcome
+                regime = "unknown"
+                await record_outcome(self._db, pos["strategy"], regime, sym, realized_pnl, is_paper=False)
+                log.info("Live position closed (reconciled)", symbol=sym, side=side,
+                         entry=entry, exit=close_price, pnl=round(realized_pnl, 4))
+                asyncio.create_task(send_alert(
+                    "position_close", symbol=sym, side=side,
+                    entry=entry, exit=close_price,
+                    pnl=round(realized_pnl, 4), mode="live",
+                ))
+            except Exception as e:
+                log.warning("reconcile: failed to record closed position", symbol=sym, error=str(e))
 
     def _adaptive_interval(self) -> float:
         state = self._portfolio.get_state()

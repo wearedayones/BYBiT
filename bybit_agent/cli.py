@@ -465,11 +465,27 @@ def report(
                     "Review top rejection reasons and adjust risk parameters or EV threshold."
                 )
         elif total == 0 and total_approved > 0:
-            bottleneck = "paper_mode"
-            recommendation = (
-                f"Paper/shadow mode — {total_approved} signals approved (shadow) of {total_signals}. "
-                "No live trades until promotion gate passes. System healthy."
-            )
+            # Distinguish true shadow mode from live mode with no closed trades yet.
+            _trading_mode = "shadow"
+            try:
+                _mode_rows = await db.fetch(
+                    "SELECT trading_mode FROM agent_state WHERE id = 'singleton' LIMIT 1"
+                )
+                _trading_mode = (_mode_rows[0].get("trading_mode") if _mode_rows else None) or "shadow"
+            except Exception:
+                pass
+            if _trading_mode == "shadow":
+                bottleneck = "paper_mode"
+                recommendation = (
+                    f"Shadow mode — {total_approved} signals approved (paper) of {total_signals}. "
+                    "Use `bybit cutover testnet_live` when ready for real testnet fills."
+                )
+            else:
+                bottleneck = "no_closed_trades"
+                recommendation = (
+                    f"Live mode ({_trading_mode}) — {total_approved} signals approved of {total_signals}. "
+                    "No closed trades yet (positions still open or just opened). Normal at session start."
+                )
         elif total > 0 and total > 0 and wins / total < 0.40:
             bottleneck = "low_win_rate"
             recommendation = (
