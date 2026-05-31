@@ -9,7 +9,7 @@
 > Python loop trades 24/7; you (the AI) wake via the event queue to review, tune, and
 > document — never in the hot path.
 
-_Last rendered: 2026-05-31 18:34 UTC_
+_Last rendered: 2026-05-31 19:02 UTC_
 
 ---
 ## 🎯 1. Account State
@@ -18,13 +18,13 @@ _Last rendered: 2026-05-31 18:34 UTC_
 | Environment | `testnet` |
 | Status | `running` |
 | Kill switch | 🟢 clear |
-| Equity | `78.2541` |
+| Equity | `78.2026` |
 | Peak equity | `78.4735` |
-| Drawdown | `0.28%` |
+| Drawdown | `0.35%` |
 | Daily realized P&L | `0` |
 | Max risk / trade | `0.015` |
-| Promotion cycles | `326` |
-| Last cycle | `2026-05-31 18:34:29.447914+00` |
+| Promotion cycles | `345` |
+| Last cycle | `2026-05-31 19:02:31.730941+00` |
 
 ## 📊 2. Trade Performance (closed)
 _No closed trades yet — paper simulation will populate this._
@@ -37,13 +37,13 @@ _No closed trades yet — paper simulation will populate this._
 ## ⚙️ 4. Live Strategy Weights
 | Strategy | Weight | On | Win rate | 48h win | Trades |
 |---|---|---|---|---|---|
-| funding_harvest | 1.2 | ✅ | None | None | 0 |
-| mean_reversion | 1.0 | ✅ | None | None | 0 |
-| trend_momentum | 1.0 | ✅ | None | None | 0 |
-| crowded_positioning | 1.0 | ✅ | None | None | 0 |
+| funding_harvest | 1.2 | ⛔ | None | None | 0 |
+| mean_reversion | 1.0 | ⛔ | None | None | 0 |
+| crowded_positioning | 1.0 | ⛔ | None | None | 0 |
+| trend_momentum | 1.0 | ⛔ | None | None | 0 |
+| dca | 0.9 | ⛔ | None | None | 0 |
 | grid | 0.9 | ✅ | None | None | 0 |
-| dca | 0.9 | ✅ | None | None | 0 |
-| breakout | 0.8 | ✅ | None | None | 0 |
+| breakout | 0.8 | ⛔ | None | None | 0 |
 
 ## 🔧 5. Tuned Parameters (agent_config)
 _Defaults in use (no overrides)._
