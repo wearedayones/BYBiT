@@ -300,6 +300,64 @@ or the `bybit tune` / `bybit weights` commands which feed into the next cycle.
 
 ---
 
+## Autonomous Decision Authority
+
+**The AI agent (Claude Code or any other) has full authority to make all of the following
+decisions without asking the user.** The user does not need to be present. Act on the data.
+
+### What you can always decide alone
+
+| Decision | How to act | Condition |
+|---|---|---|
+| Resolve `scheduled_review` | `bybit resolve <UUID> --action reviewed` | After reading report and tuning |
+| Resolve `risk_escalation` | `bybit resolve <UUID> --action acknowledged` | Check drawdown < 5% first |
+| Resolve `market_event` | `bybit resolve <UUID> --action acknowledged` | Read context; reduce weight if systematic |
+| Approve `ambiguous_decision` | `bybit decide <UUID> --action approve` | Score > 0.7 AND ev > 0 AND no open position |
+| Reject `ambiguous_decision` | `bybit decide <UUID> --action reject` | Any other case — default is always safe |
+| Adjust `maxRiskPct` | `bybit tune --set maxRiskPct=X` | Data from last 24h supports it; stay within 0.001–0.03 |
+| Adjust strategy weight | `bybit weights --set <strategy>=X` | 48h win rate clearly above or below threshold |
+| Disable a losing strategy | `bybit weights --toggle <strategy>` | Win rate < 40% over > 10 trades |
+| Restart a hung loop | `systemctl restart bybit` | `last_cycle_at` is > 5 min stale |
+| Fix a code bug | Edit + `pytest` + commit + push | Any Python traceback in logs |
+| Pause for investigation | `bybit pause` | Drawdown > 5% or kill fired unexpectedly |
+
+### What the bot's Python loop decides autonomously (no agent needed)
+
+The 60s trading loop is fully self-managing. It runs these automatically without any agent or user:
+
+| Capability | Where | Cadence |
+|---|---|---|
+| Strategy signal generation | `DecisionEngine` | Every cycle |
+| Order execution (enter / trail / TP / SL) | `ExecutionRouter` + `PositionHealthManager` | Every cycle |
+| Regime-aware weight tuning | `regime_aware_adjust()` in `ml/learner.py` | Every 30 cycles (~5 min) |
+| Outcome-based weight decay | `adaptive_weight_decay()` in `ml/learner.py` | Every 10 cycles |
+| Risk auto-scaling by drawdown | `_auto_manage()` in `AgentLoop` | Every 30 cycles |
+| Promotion: testnet → mainnet | `PromotionManager` | Every cycle |
+| Crisis protection | `classify_regime()` + `_auto_manage()` | Every 30 cycles |
+| Per-symbol margin backoff | `_margin_cooldown` in `AgentLoop` | On 110007 error |
+| Trade outcome learning | `record_outcome()` in `ml/learner.py` | On every close |
+| Full retrain from history | `retrain_from_history()` | After every 50 outcomes |
+| Leader score + copy follow/drop | `CopyTradingManager` | Every 4h |
+| Grid bot management | `BotManager` | Every cycle |
+| Code self-update (git pull) | `repo_updater.py` | Every 15 min |
+| Database pruning | `maintenance/pruner.py` | Weekly |
+
+**Bottom line:** the bot runs itself. The AI agent's job is to resolve events, read the
+weekly performance report, and tune one or two parameters when data clearly supports it.
+No standing orders from the user are required.
+
+### When to escalate to the user (only these cases)
+
+1. `kill_engaged: true` and you can't find the root cause in logs
+2. Equity has dropped > 10% and you don't understand why
+3. You are about to flip trading mode from `testnet_live` to `mainnet_live` (real money)
+4. A code change touches the signing layer, DB schema, or risk limits
+5. The bot has been stuck with no trades for > 72 hours despite healthy signals
+
+Everything else: read the data, apply the decision rules above, act.
+
+---
+
 ## Event Kinds and Default Responses
 
 | Kind | Severity | Default | When to override |
@@ -548,7 +606,7 @@ tests/                          ← 104 tests (all must pass before committing)
  4. Market discovery (every 5 min) → top-N affordable symbols
  5. Fetch snapshots → klines → indicators → regime for each symbol
  6. Position health → breakeven / trail / partial-TP / time-exit per open position
- 7. Decision engine → 4 strategies × N symbols → composite score → confidence floor
+ 7. Decision engine → 5 strategies × N symbols → composite score → confidence floor
  8. Risk approval → size → EV → R:R → position-count → open-symbol guard
  9. Execution (paper=True in shadow, live after cutover) → maker-first → taker fallback
 10. Bot tick → grid bots in ranging regime
@@ -558,6 +616,11 @@ tests/                          ← 104 tests (all must pass before committing)
 14. Reports → daily / weekly / monthly
 15. GitHub update check (every 15 min) → pull + pip install + os.execv respawn
 16. Write last_cycle_at to agent_state
+
+--- autonomous self-management (every 30 cycles, ~5 min) ---
+A. Regime-aware weight tuning → up-weight strategies that fit live regime mix
+B. Risk auto-scaling → shrink maxRiskPct on drawdown, expand near equity ATH
+C. Crisis protection → decay non-crisis strategies when crisis regime dominates
 ```
 
 ---

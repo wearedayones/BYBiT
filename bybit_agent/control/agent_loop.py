@@ -26,6 +26,7 @@ from bybit_agent.config.constants import (
 
 SIGNAL_DROUGHT_THRESHOLD = 60        # consecutive cycles with signals but no approval (~1 h)
 ADAPT_EVERY_CYCLES = 10              # run adaptive_weight_decay every N cycles
+AUTO_MANAGE_CYCLES = 30              # full autonomous self-management pass every N cycles (~5 min)
 MARGIN_FAIL_THRESHOLD = 3            # consecutive 110007s before cooldown
 MARGIN_COOLDOWN_CYCLES = 20          # skip symbol for ~20 cycles after threshold hit
 BRAIN_RENDER_INTERVAL_MS  = 30 * 60 * 1_000        # re-render brain.md every 30 min
@@ -89,6 +90,8 @@ class AgentLoop:
         self._drought_signals_seen: int = 0
         self._cycle_count: int = 0
         self._leverage: int = LEVERAGE_DEFAULTS["DEFAULT"]
+        # Auto-management: remember last cycle where we changed maxRiskPct to avoid thrashing.
+        self._last_risk_adjust_cycle: int = 0
 
         # In-memory paper positions: {symbol → position dict}
         # Persisted on close to trades table; rebuilt from DB on restart.
@@ -543,6 +546,13 @@ class AgentLoop:
         except Exception as e:
             log.warning("Retrain check failed", error=str(e))
 
+        # ── 9c. Autonomous self-management ──────────────────────────────────
+        if self._cycle_count % AUTO_MANAGE_CYCLES == 0:
+            try:
+                await self._auto_manage(snapshots)
+            except Exception as e:
+                log.warning("Auto-manage failed", error=str(e))
+
         # ── 10. Update agent_state ──────────────────────────────────────────
         await self._db.execute(
             "UPDATE agent_state SET last_cycle_at = now(), updated_at = now() WHERE id = 'singleton'"
@@ -762,6 +772,89 @@ class AgentLoop:
                 ))
             except Exception as e:
                 log.warning("reconcile: failed to record closed position", symbol=sym, error=str(e))
+
+    async def _auto_manage(self, snapshots) -> None:
+        """Fully autonomous self-management — runs every AUTO_MANAGE_CYCLES without user input.
+
+        Three actions per pass:
+          1. Regime-aware strategy weight tuning: up-weight strategies that fit the live
+             regime mix, down-weight those that don't.
+          2. Risk parameter auto-scaling: shrink maxRiskPct when drawdown is growing,
+             expand it when equity is at peak and conditions are calm.
+          3. Crisis protection: if the majority of symbols are in crisis regime, push
+             all non-crisis-safe strategies toward minimum weight.
+
+        Every adjustment is bounded by PARAM_WHITELIST and leaves a log trail so any
+        AI agent that reads the logs can see exactly what changed and why.
+        """
+        # ── 1. Regime-aware weight tuning ────────────────────────────────────
+        try:
+            from bybit_agent.ml.learner import regime_aware_adjust
+            regimes = [classify_regime(s) for s in snapshots if s is not None]
+            await regime_aware_adjust(self._db, regimes)
+        except Exception as e:
+            log.debug("Regime weight adjust failed (non-fatal)", error=str(e))
+
+        # ── 2. Risk parameter auto-scaling ───────────────────────────────────
+        # Anti-thrash: only adjust if last change was at least 50 cycles ago.
+        if self._cycle_count - self._last_risk_adjust_cycle < 50:
+            return
+
+        state = self._portfolio.get_state()
+        if state.peakEquity <= 0 or state.equity <= 0:
+            return
+
+        drawdown = (state.peakEquity - state.equity) / state.peakEquity
+
+        # Read current maxRiskPct from agent_config (CLI tune target) or agent_state fallback.
+        current_risk = 0.01  # sensible default
+        try:
+            rows = await self._db.fetch(
+                "SELECT value FROM agent_config WHERE key = 'max_risk_pct' LIMIT 1"
+            )
+            if rows and rows[0].get("value") is not None:
+                current_risk = float(rows[0]["value"])
+            else:
+                state_rows = await self._db.fetch(
+                    "SELECT max_risk_pct FROM agent_state WHERE id = 'singleton' LIMIT 1"
+                )
+                if state_rows and state_rows[0].get("max_risk_pct") is not None:
+                    current_risk = float(state_rows[0]["max_risk_pct"])
+        except Exception:
+            pass
+
+        # Scale risk inversely with drawdown, within PARAM_WHITELIST bounds [0.001, 0.03].
+        if drawdown > 0.04:        # > 4% drawdown — cut risk sharply
+            new_risk = max(0.002, current_risk * 0.70)
+        elif drawdown > 0.02:      # 2–4% drawdown — reduce risk
+            new_risk = max(0.003, current_risk * 0.85)
+        elif drawdown < 0.005 and state.equity >= state.peakEquity * 0.998:
+            # Near all-time-high equity and very low drawdown — can increase risk slightly.
+            new_risk = min(0.02, current_risk * 1.05)
+        else:
+            return  # 0.5–2% drawdown: no change needed
+
+        new_risk = round(new_risk, 5)
+        if abs(new_risk - current_risk) / current_risk < 0.05:
+            return  # Change is < 5% — not worth the noise.
+
+        try:
+            await self._db.execute(
+                """INSERT INTO agent_config (key, value, updated_at)
+                   VALUES ('max_risk_pct', $1::text, now())
+                   ON CONFLICT (key) DO UPDATE SET value = $1::text, updated_at = now()""",
+                str(new_risk),
+            )
+            self._last_risk_adjust_cycle = self._cycle_count
+            log.info(
+                "Auto-adjusted maxRiskPct",
+                old=round(current_risk, 5),
+                new=new_risk,
+                drawdown_pct=round(drawdown * 100, 2),
+                equity=round(state.equity, 2),
+            )
+        except Exception as e:
+            log.debug("Auto risk param update failed (non-fatal)", error=str(e))
 
     def _adaptive_interval(self) -> float:
         state = self._portfolio.get_state()

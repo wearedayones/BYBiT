@@ -159,6 +159,112 @@ async def adaptive_weight_decay(db) -> None:
             log.debug("Weight update failed", strategy=strategy, error=str(exc))
 
 
+# ── layer 2b: regime-aware weight adjustment (called by auto_manage each cycle) ──
+
+# Maps each strategy to the regimes where it is designed to excel.
+# Must stay in sync with each strategy class's `suitable_regimes` attribute.
+_STRATEGY_REGIMES: dict[str, set[str]] = {
+    "trend_momentum":      {"trending"},
+    "mean_reversion":      {"ranging", "crisis", "crowded_long", "crowded_short"},
+    "breakout":            {"trending", "high_volatility"},
+    "funding_harvest":     {"trending", "ranging", "high_volatility", "crisis",
+                            "crowded_long", "crowded_short"},
+    "crowded_positioning": {"crowded_long", "crowded_short"},
+    "grid":                {"ranging"},
+    "dca":                 {"ranging", "high_volatility"},
+}
+
+# Small nudges keep the system stable; larger changes come from record_outcome() / retrain.
+_REGIME_BOOST_FACTOR = 1.03   # +3% when ≥60% of snapshots fit this strategy's regimes
+_REGIME_DECAY_FACTOR = 0.97   # −3% when ≤20% of snapshots fit
+_REGIME_ADJUST_COOLDOWN = 50  # cycles between adjustments for the same strategy
+
+
+async def regime_aware_adjust(db, snapshot_regimes: list[str]) -> None:
+    """Nudge strategy weights based on how well each strategy fits the current regime mix.
+
+    Called from AgentLoop._auto_manage() every AUTO_MANAGE_CYCLES. Strategies that are
+    a poor fit for the live regime mix are gently decayed; well-fitted ones are gently
+    boosted. This lets the bot self-optimise its strategy allocation without user input.
+    """
+    if not snapshot_regimes:
+        return
+
+    from collections import Counter
+    regime_counts = Counter(snapshot_regimes)
+    total = sum(regime_counts.values())
+    dominant = regime_counts.most_common(1)[0][0]
+
+    # Crisis mode: if majority of symbols are in crisis, cut all non-crisis-safe weights.
+    crisis_fraction = regime_counts.get("crisis", 0) / total if total else 0.0
+    in_crisis = crisis_fraction >= 0.5
+
+    try:
+        rows = await db.fetch(
+            "SELECT strategy, weight, enabled, last_adapted_at FROM strategy_weights"
+        )
+    except Exception as exc:
+        log.debug("regime_aware_adjust query failed", error=str(exc))
+        return
+
+    for row in rows:
+        strategy = row.get("strategy") or ""
+        if not strategy or not row.get("enabled"):
+            continue
+
+        suitable = _STRATEGY_REGIMES.get(strategy, set())
+        current_weight = float(row.get("weight") or 1.0)
+
+        # Anti-oscillation: skip if adapted very recently.
+        last_adapted = row.get("last_adapted_at")
+        if last_adapted is not None:
+            import datetime as _dt
+            if hasattr(last_adapted, "timestamp"):
+                age_s = (
+                    _dt.datetime.now(_dt.timezone.utc).timestamp() - last_adapted.timestamp()
+                )
+                # Skip if adapted within the last 10 minutes.
+                if age_s < 600:
+                    continue
+
+        # Crisis override: if we're in a crisis regime, strategies not designed for it
+        # get their weights pushed toward the minimum to reduce exposure.
+        if in_crisis and "crisis" not in suitable:
+            factor = _REGIME_DECAY_FACTOR
+        else:
+            fit_count = sum(cnt for regime, cnt in regime_counts.items() if regime in suitable)
+            fit_score = fit_count / total if total > 0 else 0.0
+
+            if fit_score >= 0.60:
+                factor = _REGIME_BOOST_FACTOR
+            elif fit_score <= 0.20:
+                factor = _REGIME_DECAY_FACTOR
+            else:
+                continue  # Neutral fit — leave weight unchanged.
+
+        new_weight = round(max(_WEIGHT_MIN, min(_WEIGHT_MAX, current_weight * factor)), 4)
+        if abs(new_weight - current_weight) < 0.005:
+            continue
+
+        try:
+            await db.execute(
+                """UPDATE strategy_weights
+                   SET weight = $1, last_adapted_at = now()
+                   WHERE strategy = $2""",
+                new_weight, strategy,
+            )
+            log.info(
+                "Regime weight adjusted",
+                strategy=strategy,
+                old_weight=round(current_weight, 4),
+                new_weight=new_weight,
+                dominant_regime=dominant,
+                in_crisis=in_crisis,
+            )
+        except Exception as exc:
+            log.debug("Regime weight update failed", strategy=strategy, error=str(exc))
+
+
 # ── layer 3: full batch retrain (on-demand) ───────────────────────────────────
 
 async def retrain_from_history(db, window_days: int = 30) -> dict:
