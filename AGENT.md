@@ -216,6 +216,108 @@ Expired events are auto-resolved with their default — the loop never blocks on
 
 ---
 
+## VPS Migration (moving the bot to a new server)
+
+All state lives in Neon (cloud Postgres). The VPS is just a process host.
+No data migration — the new machine connects to the same DB and continues from where it left off.
+
+### Pre-flight (run on the OLD machine before anything else)
+
+```bash
+# 1. Pause the loop so the two machines don't both place orders
+bybit pause
+
+# 2. Confirm paused
+bybit status --json   # expect "status": "paused"
+```
+
+### On the NEW VPS (Ubuntu 22.04/24.04)
+
+```bash
+# 3. Install Python 3.11+
+sudo apt update && sudo apt install -y python3.11 python3.11-venv python3-pip git
+
+# 4. Clone repo (use the current active branch)
+git clone https://github.com/wearedayones/BYBiT.git /root/BYBiT
+cd /root/BYBiT
+git checkout claude/os-details-capabilities-ZbyYw
+
+# 5. Install Python package
+pip3 install -e .
+
+# 6. Copy .env from old machine
+#    Required keys:
+#      BYBIT_API_KEY          - Bybit API key (Read + Trade only, never Withdraw)
+#      BYBIT_API_PRIVATE_KEY_PATH - path to RSA private key PEM file (e.g. /root/BYBiT/bybit_private.pem)
+#      DATABASE_URL           - Neon Postgres connection string (must use ?sslmode=require)
+#      TELEGRAM_BOT_TOKEN     - optional, for alerts
+#      TELEGRAM_CHAT_ID       - optional, for alerts
+#      LOG_LEVEL              - optional, default INFO
+#    Copy the RSA key file to the path set in BYBIT_API_PRIVATE_KEY_PATH.
+#    Permissions: chmod 600 /path/to/private_key.pem
+
+# 7. Verify connectivity
+bybit migrate   # no-op if DB is already up to date; safe to re-run
+bybit doctor    # must show all green — DB, signing, env
+
+# 8. Resume on the NEW machine
+bybit resume    # clears the paused flag in DB
+
+# 9. Start the service
+```
+
+**Systemd (recommended — survives reboots):**
+```bash
+sudo tee /etc/systemd/system/bybit.service > /dev/null <<'EOF'
+[Unit]
+Description=BYBiT Trading Agent
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+User=root
+WorkingDirectory=/root/BYBiT
+ExecStart=/usr/local/bin/bybit run
+Restart=always
+RestartSec=10
+EnvironmentFile=/root/BYBiT/.env
+StandardOutput=append:/var/log/bybit.log
+StandardError=append:/var/log/bybit.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable bybit
+sudo systemctl start bybit
+
+# Confirm running
+sudo systemctl status bybit
+bybit status --json   # expect "status": "running", trading_mode matches DB
+```
+
+**Watch live logs:**
+```bash
+sudo journalctl -u bybit -f
+# or: tail -f /var/log/bybit.log
+```
+
+### Post-migration check
+
+```bash
+bybit status --json    # status=running, trading_mode=testnet_live (or whatever it was)
+bybit positions --json # open positions should appear within one cycle (~60s)
+bybit events --json    # no unexpected new events
+```
+
+### Rollback
+If anything is wrong on the new VPS: `bybit kill --reason "migration rollback"`, fix the issue,
+then `bybit run` again. The old machine can resume if needed by clearing the kill flag in DB.
+
+---
+
 ## Emergency Actions
 
 ```bash
