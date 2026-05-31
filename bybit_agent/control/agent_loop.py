@@ -445,21 +445,32 @@ class AgentLoop:
                 try:
                     import json as _json
                     regime = classify_regime(snap)
+                    # trades schema: realized_pnl (not pnl); pnl_pct/close_reason live in meta jsonb.
                     await self._db.execute(
                         """INSERT INTO trades
-                             (decision_id, symbol, side, qty, entry_price, exit_price,
-                              pnl, pnl_pct, close_reason, strategy, is_paper)
-                           SELECT id, $1, $2, $3, $4, $5, $6, $7, $8, $9, true
+                             (decision_id, symbol, category, side, qty, entry_price,
+                              exit_price, realized_pnl, strategy, is_paper,
+                              opened_at, closed_at, meta)
+                           SELECT id, $1, 'linear', $2, $3, $4, $5, $6, $7, true,
+                                  $8::timestamptz, now(), $9::jsonb
                            FROM decision_log
-                           WHERE cycle_id = $10::uuid AND symbol = $1
+                           WHERE cycle_id = $10::uuid AND symbol = $1 AND strategy = $7
                            LIMIT 1""",
                         sym, side, pos["qty"], pos["entry_price"], exit_px,
-                        pnl_abs, pnl_pct, reason, pos["strategy"], pos["cycle_id"],
+                        pnl_abs, pos["strategy"], pos["opened_at"],
+                        _json.dumps({"close_reason": reason, "pnl_pct": pnl_pct,
+                                     "regime": regime, "paper_sim": True}),
+                        pos["cycle_id"],
                     )
                     from bybit_agent.ml.learner import record_outcome
                     await record_outcome(
                         self._db, pos["strategy"], regime, sym, pnl_abs, is_paper=True
                     )
+                    asyncio.create_task(send_alert(
+                        "position_close", symbol=sym, reason=reason,
+                        entry=pos["entry_price"], exit=exit_px,
+                        pnl=round(pnl_abs, 4), mode="paper",
+                    ))
                 except Exception as e:
                     log.warning("Paper trade close failed", symbol=sym, error=str(e))
 

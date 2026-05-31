@@ -1752,5 +1752,55 @@ def train(
     asyncio.run(_run())
 
 
+@app.command()
+def brain(
+    note: Annotated[str, typer.Option("--note", help="Persist a lesson/decision to the DB ledger")] = "",
+    category: Annotated[str, typer.Option("--category", help="lesson|decision|directive|observation")] = "lesson",
+    show: Annotated[bool, typer.Option("--show", help="Print brain.md to stdout instead of writing")] = False,
+    path: Annotated[str, typer.Option("--path")] = "brain.md",
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Render the DB-backed brain.md memory ledger, or append a note to it.
+
+    brain.md is rendered FROM Postgres (the single source of truth) — it is never
+    parsed back into config. Use --note to persist a durable lesson/decision.
+    """
+
+    async def _run() -> None:
+        from .control import brain as _brain
+
+        db = await _get_db()
+        if not db:
+            typer.echo("❌ DB unavailable", err=True)
+            raise typer.Exit(1)
+
+        if note:
+            await _brain.add_note(db, note, category=category)
+            if as_json:
+                _print_json({"added": True, "category": category, "note": note})
+            else:
+                typer.echo(f"🧠 Note saved to brain_notes [{category}].")
+            return
+
+        content = await _brain.render(db)
+        if show:
+            if as_json:
+                _print_json({"content": content})
+            else:
+                typer.echo(content)
+            return
+
+        import os
+        abspath = os.path.abspath(path)
+        with open(abspath, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        if as_json:
+            _print_json({"written": abspath, "bytes": len(content)})
+        else:
+            typer.echo(f"🧠 brain.md rendered → {abspath} ({len(content)} bytes)")
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     app()

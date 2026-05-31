@@ -112,6 +112,20 @@ default automatically (ambiguous → reject, risk → acknowledge). The AI's abs
 | `bybit weights --toggle strategy [--json]` | Enable / disable a strategy |
 | `bybit review` | Run an immediate SelfReview pass |
 
+### Memory, P&L & Learning
+
+| Command | Description |
+|---|---|
+| `bybit brain [--show] [--path P] [--json]` | Render the DB-backed `brain.md` memory ledger (account state, queue, weights, learned priors, lessons) from Postgres. `--show` prints to stdout instead of writing |
+| `bybit brain --note "TEXT" [--category lesson\|decision\|directive\|observation]` | Persist a durable note to the `brain_notes` table (survives restarts; never lost) |
+| `bybit pl [--json]` | Real-time P&L for open positions (live + paper) |
+| `bybit signal <SYMBOL> [--category linear] [--json]` | Run the full signal pipeline for one symbol and print decisions (no execution) |
+| `bybit train [--window DAYS] [--json]` | Trigger a full batch retrain of `learned_signals` from trade history |
+
+> **brain.md is rendered FROM the DB — never parsed back into config.** Postgres stays the
+> single source of truth; the 60-second trading loop never reads or writes `brain.md`. Config
+> changes still flow only through `bybit tune` / `bybit weights`.
+
 ### Tunable Parameters (PARAM_WHITELIST)
 
 | Param | Range | Description |
@@ -126,6 +140,11 @@ default automatically (ambiguous → reject, risk → acknowledge). The AI's abs
 | `trailStartR` | 1.0–5.0 | R-multiple at which ATR trailing begins |
 | `partialTpAtR` | 0.5–3.0 | R-multiple for partial TP (closes 50% of position) |
 | `maxHoldCycles` | 10–200 | Cycles before a stale flat position is closed |
+| `defaultLeverage` | 1–20 | Exchange leverage applied to new positions (1 = none). Lets small accounts reach minimum lot sizes; risk budget is still computed from real equity |
+
+For accounts under **$50**, discovery automatically falls back to a micro-capital symbol
+universe (DOGE, SHIB, PEPE, FLOKI, BONK, WIF, ADA, XRP, TRX, LTC) so minimum lot sizes are
+affordable. Combine with `defaultLeverage` to make $1–$10 accounts tradable.
 
 Changes take effect the next cycle — no restart required.
 
