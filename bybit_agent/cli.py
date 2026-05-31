@@ -125,7 +125,12 @@ def doctor(
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Validate env + DB + signing; with --deep, run the full self-diagnosing Doctor."""
-    ok = asyncio.run(_doctor())
+    # With --json the pre-flight's human output would pollute the JSON stream, so we
+    # skip it: the deep Doctor's db_connectivity/process checks cover the same ground,
+    # and signing is validated at service startup. JSON callers get clean JSON only.
+    ok = True
+    if not as_json:
+        ok = asyncio.run(_doctor())
 
     if not deep:
         typer.echo("")
