@@ -364,6 +364,9 @@ def report(
                 ),
             )
             # ── signal analytics (paper-inclusive — primary learning input) ──
+            trading_mode_rows = await db.fetch(
+                "SELECT trading_mode FROM agent_state WHERE id = 'singleton' LIMIT 1"
+            )
             sig_by_strategy, rejection_rows, last_approved_rows, regime_rows = await asyncio.gather(
                 db.fetch(
                     f"""SELECT strategy,
@@ -465,15 +468,7 @@ def report(
                     "Review top rejection reasons and adjust risk parameters or EV threshold."
                 )
         elif total == 0 and total_approved > 0:
-            # Distinguish true shadow mode from live mode with no closed trades yet.
-            _trading_mode = "shadow"
-            try:
-                _mode_rows = await db.fetch(
-                    "SELECT trading_mode FROM agent_state WHERE id = 'singleton' LIMIT 1"
-                )
-                _trading_mode = (_mode_rows[0].get("trading_mode") if _mode_rows else None) or "shadow"
-            except Exception:
-                pass
+            _trading_mode = (trading_mode_rows[0].get("trading_mode") if trading_mode_rows else None) or "shadow"
             if _trading_mode == "shadow":
                 bottleneck = "paper_mode"
                 recommendation = (
