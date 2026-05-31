@@ -269,8 +269,18 @@ class AgentLoop:
             if not self._decisions.paper:
                 try:
                     side = "Buy" if sig.action == "enter_long" else "Sell"
-                    order_link_id = f"agent-{sig.strategy}-{sig.symbol}-{int(time.time() * 1000)}"
+                    # Bybit max orderLinkId length = 45 chars.
+                    strat_abbr = sig.strategy[:8]
+                    sym_abbr   = sig.symbol[:12]
+                    order_link_id = f"ag-{strat_abbr}-{sym_abbr}-{int(time.time())}"[:45]
                     ref_price = sig.suggestedEntry or snap.lastPrice
+                    # Validate stop loss direction against current price — signal may be stale.
+                    raw_stop = approval.stopPrice or None
+                    if raw_stop:
+                        if side == "Sell" and raw_stop <= ref_price:
+                            raw_stop = ref_price * 1.02  # 2% above entry for shorts
+                        elif side == "Buy" and raw_stop >= ref_price:
+                            raw_stop = ref_price * 0.98  # 2% below entry for longs
                     await self._client.set_leverage("linear", sig.symbol, self._leverage)
                     result = await self._execution.enter(EnterParams(
                         category="linear",
@@ -278,7 +288,7 @@ class AgentLoop:
                         side=side,
                         qty=approval.qty,
                         refPrice=ref_price,
-                        stopLoss=approval.stopPrice or None,
+                        stopLoss=raw_stop,
                         takeProfit=approval.tpPrice,
                         orderLinkId=order_link_id,
                     ))

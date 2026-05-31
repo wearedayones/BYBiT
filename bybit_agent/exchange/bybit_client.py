@@ -153,10 +153,15 @@ class BybitClient:
         await self._private_post("/v5/order/cancel-all", body)
 
     async def set_leverage(self, category: Category, symbol: str, leverage: int) -> None:
-        await self._private_post(
-            "/v5/position/set-leverage",
-            {"category": category, "symbol": symbol, "buyLeverage": str(leverage), "sellLeverage": str(leverage)},
-        )
+        try:
+            await self._private_post(
+                "/v5/position/set-leverage",
+                {"category": category, "symbol": symbol, "buyLeverage": str(leverage), "sellLeverage": str(leverage)},
+            )
+        except Exception as e:
+            # 110043 = leverage already set to the requested value — not an error.
+            if "110043" not in str(e):
+                raise
 
     async def set_trading_stop(self, category: Category, symbol: str, **opts: Any) -> None:
         await self._private_post("/v5/position/trading-stop", {"category": category, "symbol": symbol, **opts})
