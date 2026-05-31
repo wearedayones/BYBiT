@@ -156,12 +156,16 @@ class BotManager:
             "cell_number": cell_number, "total_investment": str(investment),
         })
 
+        # Bybit returns orderId on mainnet; testnet may return 0/None.
+        grid_id = (result.get("orderId") or result.get("grid_id")
+                   or result.get("gridId") or result.get("botId"))
+
         await self._db.execute(
             """INSERT INTO bot_instances
                  (bot_type, exchange_bot_id, symbol, category, status, config, state, is_paper)
                VALUES ('spot_grid', $1, $2, 'spot', 'active', $3::jsonb, '{}'::jsonb, $4)""",
-            result.get("grid_id"), spot_symbol, json.dumps(config), self._is_testnet,
+            str(grid_id) if grid_id else None, spot_symbol, json.dumps(config), self._is_testnet,
         )
         log.info("Spot grid bot created", symbol=spot_symbol,
-                 grid_id=result.get("grid_id"), investment=round(investment, 2),
+                 grid_id=grid_id, investment=round(investment, 2),
                  testnet=self._is_testnet)
