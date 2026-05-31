@@ -242,48 +242,173 @@ def report(
 ) -> None:
     """Structured performance digest — the AI's reasoning input for tune/weights decisions."""
 
+    _INTERVAL = {"daily": "1 day", "weekly": "7 days", "monthly": "30 days"}
+
     async def _run() -> None:
+        import datetime as _dt
+        interval = _INTERVAL.get(period, "1 day")
         db = await _get_db()
         try:
-            # Equity curve summary
-            snap_rows = await db.fetch(
-                f"""SELECT total_equity, drawdown_pct, ts
-                    FROM equity_snapshots
-                    WHERE ts > now() - INTERVAL '1 {period}'
-                    ORDER BY ts"""
+            # ── core queries ────────────────────────────────────────────
+            snap_rows, trade_rows, weight_rows, config_rows = await asyncio.gather(
+                db.fetch(
+                    f"""SELECT total_equity, drawdown_pct, ts
+                        FROM equity_snapshots
+                        WHERE ts > now() - INTERVAL '{interval}'
+                        ORDER BY ts"""
+                ),
+                db.fetch(
+                    f"""SELECT strategy, side, realized_pnl, closed_at
+                        FROM trades
+                        WHERE closed_at > now() - INTERVAL '{interval}'
+                          AND is_paper = false
+                        ORDER BY closed_at DESC LIMIT 100"""
+                ),
+                db.fetch(
+                    "SELECT strategy, weight, enabled FROM strategy_weights ORDER BY strategy"
+                ),
+                db.fetch(
+                    "SELECT key, value, description FROM agent_config ORDER BY key"
+                ),
             )
-            # Trade summary
-            trade_rows = await db.fetch(
-                f"""SELECT strategy, side, realized_pnl, closed_at
-                    FROM trades
-                    WHERE closed_at > now() - INTERVAL '1 {period}'
-                      AND is_paper = false
-                    ORDER BY closed_at DESC LIMIT 100"""
-            )
-            # Decision log sample
-            decision_rows = await db.fetch(
-                f"""SELECT symbol, strategy, action, approved, composite_score, is_paper, created_at
-                    FROM decision_log
-                    WHERE created_at > now() - INTERVAL '1 {period}'
-                    ORDER BY created_at DESC LIMIT 20"""
-            )
-            # Current weights
-            weight_rows = await db.fetch(
-                "SELECT strategy, weight, enabled FROM strategy_weights ORDER BY strategy"
-            )
-            # Agent config overrides
-            config_rows = await db.fetch(
-                "SELECT key, value, description FROM agent_config ORDER BY key"
+            # ── signal analytics (paper-inclusive — primary learning input) ──
+            sig_by_strategy, rejection_rows, last_approved_rows, regime_rows = await asyncio.gather(
+                db.fetch(
+                    f"""SELECT strategy,
+                            COUNT(*)::int                                          AS signals,
+                            SUM(CASE WHEN approved THEN 1 ELSE 0 END)::int        AS approved_count,
+                            ROUND(AVG(composite_score)::numeric, 3)               AS avg_score,
+                            ROUND(MAX(composite_score)::numeric, 3)               AS max_score
+                        FROM decision_log
+                        WHERE ts > now() - INTERVAL '{interval}'
+                        GROUP BY strategy
+                        ORDER BY COUNT(*) DESC"""
+                ),
+                db.fetch(
+                    f"""SELECT reject_reason, COUNT(*)::int AS count
+                        FROM decision_log
+                        WHERE approved = false
+                          AND reject_reason IS NOT NULL
+                          AND ts > now() - INTERVAL '{interval}'
+                        GROUP BY reject_reason
+                        ORDER BY COUNT(*) DESC LIMIT 10"""
+                ),
+                db.fetch(
+                    "SELECT ts FROM decision_log WHERE approved = true ORDER BY ts DESC LIMIT 1"
+                ),
+                db.fetch(
+                    f"""SELECT regime, COUNT(*)::int AS count
+                        FROM decision_log
+                        WHERE regime IS NOT NULL
+                          AND ts > now() - INTERVAL '{interval}'
+                        GROUP BY regime ORDER BY COUNT(*) DESC"""
+                ),
             )
         finally:
             from .persistence.db import close_db
             await close_db()
 
+        # ── aggregate ───────────────────────────────────────────────────
         wins = sum(1 for t in trade_rows if float(t.get("realized_pnl") or 0) > 0)
         total = len(trade_rows)
         total_pnl = sum(float(t.get("realized_pnl") or 0) for t in trade_rows)
         equities = [float(r["total_equity"]) for r in snap_rows if r.get("total_equity")]
         max_dd = max((float(r.get("drawdown_pct") or 0) for r in snap_rows), default=0)
+
+        total_signals = sum(int(r.get("signals") or 0) for r in sig_by_strategy)
+        total_approved = sum(int(r.get("approved_count") or 0) for r in sig_by_strategy)
+        approval_rate = round(total_approved / total_signals, 4) if total_signals else None
+
+        hours_since_approved: float | None = None
+        if last_approved_rows:
+            ts = last_approved_rows[0]["ts"]
+            if isinstance(ts, str):
+                ts = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_dt.timezone.utc)
+            hours_since_approved = round(
+                (_dt.datetime.now(_dt.timezone.utc) - ts).total_seconds() / 3600, 1
+            )
+
+        # ── auto-diagnose ───────────────────────────────────────────────
+        bottleneck = "ok"
+        recommendation = "System operating normally."
+
+        if total_signals == 0:
+            bottleneck = "no_signals"
+            recommendation = (
+                "No signals generated this period. Check regime classification and "
+                "strategy suitable_regimes. Try: inspect recent decision_log, then "
+                "`bybit tune --set confidenceFloor=0.35` if scores cluster just below 0.40."
+            )
+        elif total_approved == 0:
+            top_rej = rejection_rows[0]["reject_reason"] if rejection_rows else "unknown"
+            n_str = int(sig_by_strategy[0].get("signals") or 0) if sig_by_strategy else 0
+            avg_all = (
+                sum(float(r.get("avg_score") or 0) for r in sig_by_strategy)
+                / max(len(sig_by_strategy), 1)
+            )
+            bottleneck = "risk_gate"
+            recommendation = (
+                f"{total_signals} signals generated but ALL rejected by risk gate. "
+                f"Top rejection: '{top_rej}'. Avg composite score: {avg_all:.3f}. "
+                "Try: `bybit tune --set maxRiskPct=0.015` or review EV inputs if "
+                "reason is ev_negative."
+            )
+        elif approval_rate is not None and approval_rate < 0.25:
+            bottleneck = "low_approval"
+            top_rej2 = rejection_rows[0]["reject_reason"] if rejection_rows else ""
+            if "size" in top_rej2.lower() or "qty" in top_rej2.lower() or "zero" in top_rej2.lower():
+                recommendation = (
+                    f"Only {approval_rate * 100:.0f}% of signals pass — top rejection: "
+                    f"'{top_rej2}'. Equity may be too small for minimum lot sizes. "
+                    "Fix: `bybit tune --set maxRiskPct=0.03` (raises position budget) "
+                    "or let discovery find lower-minimum instruments."
+                )
+            else:
+                recommendation = (
+                    f"Only {approval_rate * 100:.0f}% of signals pass the risk gate. "
+                    f"Top rejection: '{top_rej2}'. "
+                    "Review top rejection reasons and adjust risk parameters or EV threshold."
+                )
+        elif total == 0 and total_approved > 0:
+            bottleneck = "paper_mode"
+            recommendation = (
+                f"Paper/shadow mode — {total_approved} signals approved (shadow) of {total_signals}. "
+                "No live trades until promotion gate passes. System healthy."
+            )
+        elif total > 0 and total > 0 and wins / total < 0.40:
+            bottleneck = "low_win_rate"
+            recommendation = (
+                f"Win rate {wins / total:.0%} below 40%. "
+                "Consider reducing weight on underperforming strategies via `bybit weights`."
+            )
+
+        # ── assemble ────────────────────────────────────────────────────
+        signal_analytics = {
+            "total_signals": total_signals,
+            "approved_signals": total_approved,
+            "approval_rate": approval_rate,
+            "hours_since_last_approved": hours_since_approved,
+            "by_strategy": [
+                {
+                    "strategy": r["strategy"],
+                    "signals": int(r.get("signals") or 0),
+                    "approved": int(r.get("approved_count") or 0),
+                    "avg_score": float(r.get("avg_score") or 0),
+                    "max_score": float(r.get("max_score") or 0),
+                }
+                for r in sig_by_strategy
+            ],
+            "top_rejections": [
+                {"reason": r["reject_reason"], "count": int(r.get("count") or 0)}
+                for r in rejection_rows
+            ],
+            "regime_distribution": [
+                {"regime": r["regime"], "count": int(r.get("count") or 0)}
+                for r in regime_rows
+            ],
+        }
 
         data = {
             "period": period,
@@ -293,10 +418,14 @@ def report(
             "max_drawdown_pct": round(max_dd * 100, 2),
             "equity_start": round(equities[0], 2) if equities else None,
             "equity_end": round(equities[-1], 2) if equities else None,
-            "trades": [dict(t) for t in trade_rows[:10]],
-            "recent_decisions": [dict(d) for d in decision_rows],
+            "signal_analytics": signal_analytics,
+            "interpretation": {
+                "bottleneck": bottleneck,
+                "recommendation": recommendation,
+            },
             "strategy_weights": [dict(w) for w in weight_rows],
             "agent_config_overrides": [dict(c) for c in config_rows],
+            "trades": [dict(t) for t in trade_rows[:10]],
         }
 
         if as_json:
@@ -308,6 +437,34 @@ def report(
             typer.echo(f"Max DD:      {data['max_drawdown_pct']:.2f}%")
             if equities:
                 typer.echo(f"Equity:      {data['equity_start']} → {data['equity_end']}")
+
+            typer.echo(f"\n── SIGNAL ANALYTICS ({period}) ──")
+            typer.echo(
+                f"Signals:     {total_signals}  |  Approved: {total_approved}"
+                f"  |  Rate: {f'{approval_rate:.0%}' if approval_rate is not None else 'n/a'}"
+            )
+            if hours_since_approved is not None:
+                typer.echo(f"Last approved: {hours_since_approved}h ago")
+            if sig_by_strategy:
+                typer.echo(f"\n  {'Strategy':<22}  {'signals':>7}  {'approved':>8}  avg_score")
+                for r in sig_by_strategy:
+                    typer.echo(
+                        f"  {r['strategy']:<22}  {int(r.get('signals') or 0):>7}  "
+                        f"{int(r.get('approved_count') or 0):>8}  "
+                        f"{float(r.get('avg_score') or 0):.3f}"
+                    )
+            if rejection_rows:
+                typer.echo("\n  Top rejection reasons:")
+                for r in rejection_rows[:6]:
+                    typer.echo(f"    {r['reject_reason']:<30}  ×{int(r.get('count') or 0)}")
+            if regime_rows:
+                typer.echo(f"\n  Regime distribution: "
+                           + "  ".join(f"{r['regime']}×{int(r.get('count') or 0)}" for r in regime_rows))
+
+            typer.echo(f"\n── DIAGNOSIS ──")
+            typer.echo(f"Bottleneck:  {bottleneck}")
+            typer.echo(f"Advice:      {recommendation}")
+
             typer.echo("\nStrategy weights:")
             for w in weight_rows:
                 typer.echo(f"  {w['strategy']:20s}  weight={w['weight']}  enabled={w['enabled']}")
