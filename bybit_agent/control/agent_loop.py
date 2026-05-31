@@ -199,6 +199,19 @@ class AgentLoop:
 
             any_approved = True  # at least one signal passed the risk gate this cycle
 
+            # Always record the approval in decision_log so report analytics are accurate.
+            import json as _json
+            await self._db.execute(
+                """UPDATE decision_log
+                   SET approved = true,
+                       outcome = CASE WHEN $1 THEN 'paper' ELSE outcome END,
+                       inputs = COALESCE(inputs, '{}'::jsonb) || $2::jsonb
+                   WHERE cycle_id = $3::uuid AND symbol = $4 AND strategy = $5""",
+                self._decisions.paper,
+                _json.dumps(econ),
+                cycle_id, sig.symbol, sig.strategy,
+            )
+
             # paper=True: DecisionEngine already wrote the shadow row. We skip live execution.
             # When paper=False (Phase 6 cutover), the block below fires.
             if not self._decisions.paper:

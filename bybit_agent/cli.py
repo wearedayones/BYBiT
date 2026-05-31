@@ -275,10 +275,10 @@ def report(
             sig_by_strategy, rejection_rows, last_approved_rows, regime_rows = await asyncio.gather(
                 db.fetch(
                     f"""SELECT strategy,
-                            COUNT(*)::int                                          AS signals,
-                            SUM(CASE WHEN approved THEN 1 ELSE 0 END)::int        AS approved_count,
-                            ROUND(AVG(composite_score)::numeric, 3)               AS avg_score,
-                            ROUND(MAX(composite_score)::numeric, 3)               AS max_score
+                            COUNT(*)::int                                                          AS signals,
+                            SUM(CASE WHEN approved = true OR outcome = 'paper' THEN 1 ELSE 0 END)::int AS approved_count,
+                            ROUND(AVG(composite_score)::numeric, 3)                               AS avg_score,
+                            ROUND(MAX(composite_score)::numeric, 3)                               AS max_score
                         FROM decision_log
                         WHERE ts > now() - INTERVAL '{interval}'
                         GROUP BY strategy
@@ -288,6 +288,7 @@ def report(
                     f"""SELECT reject_reason, COUNT(*)::int AS count
                         FROM decision_log
                         WHERE approved = false
+                          AND outcome != 'paper'
                           AND reject_reason IS NOT NULL
                           AND ts > now() - INTERVAL '{interval}'
                         GROUP BY reject_reason
