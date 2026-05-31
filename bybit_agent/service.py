@@ -16,16 +16,16 @@ from bybit_agent.persistence.db import NeonHttpClient, get_db
 log = get_logger().bind(module="service")
 
 
-async def start_service(testnet: bool = True) -> None:
+async def start_service() -> None:
     env = get_env()
     auth = resolve_bybit_auth(env)
-    is_testnet = env.BYBIT_ENV == "testnet" if not testnet else testnet
-
+    # Boot against testnet (safe). The first cycle reads trading_mode from DB
+    # via _get_trading_mode() and calls client.set_testnet() with the real value.
     db: NeonHttpClient = get_db()
-    client = BybitClient(auth, is_testnet=is_testnet)
+    client = BybitClient(auth, is_testnet=True)
     market = MarketDataService(client)
 
-    loop_obj = AgentLoop(client, db, is_testnet=is_testnet)
+    loop_obj = AgentLoop(client, db, is_testnet=True)
     detector = EventDetector(db, market, symbols=list(FALLBACK_SYMBOLS))
 
     loop_task     = asyncio.create_task(_run_loop(loop_obj))
@@ -44,9 +44,9 @@ async def start_service(testnet: bool = True) -> None:
         try:
             ev_loop.add_signal_handler(sig, _shutdown, sig)
         except NotImplementedError:
-            pass  # Windows doesn't support add_signal_handler
+            pass
 
-    log.info("Service starting", testnet=is_testnet)
+    log.info("Service starting")
     try:
         await asyncio.gather(loop_task, detector_task, return_exceptions=True)
     finally:

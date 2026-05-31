@@ -204,12 +204,14 @@ def _proc_running() -> bool:
 # ── run ──────────────────────────────────────────────────────────────────────
 
 @app.command()
-def run(
-    testnet: Annotated[bool, typer.Option("--testnet/--mainnet", help="Override env setting.")] = True,
-) -> None:
-    """Launch the 24/7 deterministic trading service."""
+def run() -> None:
+    """Launch the 24/7 deterministic trading service.
+
+    Trading mode (shadow / testnet_live / mainnet_live) is read from the DB
+    each cycle — use `bybit cutover <mode>` to change it at runtime.
+    """
     from .service import start_service
-    asyncio.run(start_service(testnet=testnet))
+    asyncio.run(start_service())
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -236,11 +238,13 @@ def status(
 
         ag = rows[0] if rows else {}
         snap = snap_rows[0] if snap_rows else {}
+        kill_engaged = bool(ag.get("kill_engaged", False))
         data = {
+            "trading_mode": ag.get("trading_mode", "shadow"),
             "env": ag.get("env", "unknown"),
             "status": ag.get("status", "unknown"),
-            "kill_engaged": ag.get("kill_engaged", False),
-            "kill_reason": ag.get("kill_reason"),
+            "kill_engaged": kill_engaged,
+            "kill_reason": ag.get("kill_reason") if kill_engaged else None,
             "equity": float(snap.get("total_equity") or 0),
             "drawdown_pct": round(float(snap.get("drawdown_pct") or 0) * 100, 2),
             "open_positions": snap.get("open_positions", 0),
@@ -250,6 +254,9 @@ def status(
         if as_json:
             _print_json(data)
         else:
+            mode_icons = {"shadow": "🔵", "testnet_live": "🟡", "mainnet_live": "🟢"}
+            mode = data["trading_mode"]
+            typer.echo(f"trading_mode:     {mode_icons.get(mode, '⚙️ ')} {mode}")
             typer.echo(f"env:              {data['env']}")
             typer.echo(f"status:           {data['status']}")
             typer.echo(f"kill_engaged:     {data['kill_engaged']}"
@@ -258,7 +265,8 @@ def status(
             typer.echo(f"drawdown:         {data['drawdown_pct']:.2f}%")
             typer.echo(f"open_positions:   {data['open_positions']}")
             typer.echo(f"last_cycle_at:    {data['last_cycle_at']}")
-            typer.echo(f"promotion_cycles: {data['promotion_cycle_count']}")
+            typer.echo(f"promotion_cycles: {data['promotion_cycle_count']}"
+                       + ("  ← feeds promotion gate" if mode == "testnet_live" else ""))
 
     asyncio.run(_run())
 
@@ -1041,7 +1049,7 @@ def watch(
     def _spawn() -> None:
         _LOG.parent.mkdir(parents=True, exist_ok=True)
         fh = open(_LOG, "a")  # noqa: SIM115 — intentionally left open for subprocess lifetime
-        _bot_proc[0] = subprocess.Popen(["bybit", "run", "--testnet"], stdout=fh, stderr=fh)
+        _bot_proc[0] = subprocess.Popen(["bybit", "run"], stdout=fh, stderr=fh)
 
     async def _tick() -> dict:
         from .events.queue import list_events
