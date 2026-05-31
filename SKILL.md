@@ -75,12 +75,12 @@ The CLI is a **read + tune surface only** — it never places orders directly.
 | Command | Description |
 |---|---|
 | `bybit migrate` | Apply all `migrations/*.sql` in order (idempotent) |
-| `bybit doctor` | Validate env, DB over HTTPS:443, JSONB round-trip |
+| `bybit doctor [--deep] [--dry-run] [--json]` | Validate env, DB over HTTPS:443, JSONB round-trip. `--deep` runs the live health Doctor (process, kill state, cycle freshness, drawdown, signal flow, event backlog), auto-fixes safe faults, and escalates judgment calls as events; `--dry-run` reports without acting |
 | `bybit run [--testnet/--mainnet]` | Start the 24/7 trading service |
 | `bybit status [--json]` | Agent state: env, equity, drawdown, status, kill flag |
 | `bybit positions [--json]` | Open positions from the exchange |
-| `bybit report [--period daily\|weekly\|monthly] [--json]` | Performance digest |
-| `bybit watch [--interval N] [--no-restart] [--json]` | Watchdog: health-check every N sec, auto-restart if dead |
+| `bybit report [--period daily\|weekly\|monthly] [--json]` | Performance digest + signal analytics + auto-diagnosis (bottleneck + recommended fix) |
+| `bybit watch [--interval N] [--no-restart] [--json]` | Doctor-mode watchdog: every N sec runs the full Doctor — auto-restarts a dead process, resets legacy killed-state, and escalates kill/drought/drawdown/backlog findings to the event queue. Any agent can run it as the on-call doctor |
 | `bybit pause` | Set agent status = 'paused' (loop skips cycles) |
 | `bybit resume` | Set agent status = 'running' |
 | `bybit kill [--reason TEXT] [--force]` | Cancel all orders + flatten all positions + halt |

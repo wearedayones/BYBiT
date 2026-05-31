@@ -119,15 +119,55 @@ async def _doctor() -> bool:
 
 
 @app.command()
-def doctor() -> None:
-    """Validate env, DB connectivity over 443, and a JSONB round-trip."""
+def doctor(
+    deep: Annotated[bool, typer.Option("--deep", help="Also run the live health Doctor (signal flow, kill state, drawdown, backlog) and escalate findings.")] = False,
+    treat: Annotated[bool, typer.Option("--treat/--dry-run", help="With --deep: apply safe auto-fixes and enqueue escalations (default), or just report.")] = True,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Validate env + DB + signing; with --deep, run the full self-diagnosing Doctor."""
     ok = asyncio.run(_doctor())
-    typer.echo("")
-    if ok:
-        typer.echo("All checks passed.")
+
+    if not deep:
+        typer.echo("")
+        if ok:
+            typer.echo("All checks passed.")
+        else:
+            typer.echo("Some checks failed — see above.")
+            sys.exit(1)
+        return
+
+    async def _deep() -> dict:
+        from .control.doctor import Doctor
+        db = await _get_db()
+        try:
+            # No restart_fn here — a one-shot CLI invocation shouldn't spawn a daemon.
+            doc = Doctor(db, process_alive=_proc_running(), restart_fn=None)
+            report = await (doc.treat() if treat else doc.diagnose())
+            return report.to_dict()
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+    report = asyncio.run(_deep())
+    if as_json:
+        _print_json(report)
     else:
-        typer.echo("Some checks failed — see above.")
+        typer.echo(f"\n── DOCTOR ({'treated' if treat else 'dry-run'}) ──")
+        typer.echo(f"Health: {report['worst_severity']}  |  actionable findings: {report['actionable_count']}\n")
+        for f in report["findings"]:
+            mark = "✓" if f["auto_fixed"] else ("⚕" if f["escalated"] or f["severity"] in ("warn", "critical") else "·")
+            typer.echo(f"  {mark} {f['check']:20s} [{f['severity']:8s}] {f['detail']}")
+            if f["auto_fixed"]:
+                typer.echo(f"      fixed: {f['fix_action']}")
+            elif f["recommendation"]:
+                typer.echo(f"      → {f['recommendation']}")
+    if not ok or not report["healthy"]:
         sys.exit(1)
+
+
+def _proc_running() -> bool:
+    import subprocess
+    return subprocess.run(["pgrep", "-f", "bybit run"], capture_output=True).returncode == 0
 
 
 # ── run ──────────────────────────────────────────────────────────────────────
@@ -903,6 +943,7 @@ def watch(
 
     async def _tick() -> dict:
         from .events.queue import list_events
+        from .control.doctor import Doctor
 
         db = await _get_db()
         try:
@@ -911,6 +952,12 @@ def watch(
                 "SELECT total_equity, drawdown_pct, open_positions, ts FROM equity_snapshots ORDER BY ts DESC LIMIT 1"
             )
             ev_rows   = await list_events(db, status="pending", limit=200)
+
+            # The Doctor runs while the DB is open: it auto-fixes deterministic
+            # faults (dead process, legacy killed-state) and escalates judgment
+            # calls (kill engaged, signal drought, drawdown) as dedup'd events.
+            doc = Doctor(db, process_alive=_is_alive(), restart_fn=(_spawn if restart else None))
+            report = await doc.treat()
         finally:
             from .persistence.db import close_db
             await close_db()
@@ -942,25 +989,19 @@ def watch(
             "events_pending": len(ev_rows),
             "cycle_age_s":    cycle_age_s,
             "last_cycle_at":  str(last_at or ""),
+            "doctor":         report.to_dict(),
         }
 
     async def _loop() -> None:
-        typer.echo("bybit watch — press Ctrl-C to stop\n")
+        typer.echo("bybit watch — doctor mode (auto-fix + escalate). Press Ctrl-C to stop.\n")
         prev_promo = 0
         prev_cycle = ""
 
         while True:
             t0 = asyncio.get_event_loop().time()
 
-            # 1. Liveness + optional restart
-            alive  = _is_alive()
-            restarted = False
-            if not alive and restart:
-                _spawn()
-                restarted = True
-                await asyncio.sleep(3)  # brief settle before DB read
-
-            # 2. DB tick
+            # DB tick — the Doctor runs inside it (auto-fix dead process, escalate
+            # judgment calls). It owns restart now, so no separate liveness logic here.
             try:
                 d = await _tick()
             except Exception as exc:
@@ -969,10 +1010,16 @@ def watch(
                 await asyncio.sleep(interval)
                 continue
 
-            # 3. Flags
+            report = d.get("doctor", {})
+            findings = report.get("findings", [])
+
+            # Flags — Doctor findings drive the headline; legacy flags kept for parity.
             flags: list[str] = []
-            if restarted:                                    flags.append("RESTARTED")
-            if not alive and not restart:                    flags.append("DEAD")
+            for f in findings:
+                if f.get("auto_fixed"):
+                    flags.append(f"FIXED:{f['check']}")
+                elif f.get("escalated"):
+                    flags.append(f"ESCALATED:{f['check']}")
             if d["kill_engaged"]:                            flags.append(f"KILL({d['kill_reason']})")
             if d["cycle_age_s"] is not None and d["cycle_age_s"] > 180:
                                                              flags.append(f"STALE({d['cycle_age_s']}s)")
@@ -986,24 +1033,30 @@ def watch(
             d["flags"]         = flags
             d["process_alive"] = _is_alive()
 
-            # 4. Stale+dead auto-restart
-            if "STALE" in " ".join(flags) and not d["process_alive"] and restart:
-                typer.echo(f"[{d['ts']}]  STALE+DEAD — restarting...")
-                _spawn()
-
-            # 5. Emit
+            # Emit
             if as_json:
                 typer.echo(json.dumps(d, default=str))
             else:
                 flag_str = "  ".join(flags)
+                health = report.get("worst_severity", "ok")
                 typer.echo(
                     f"[{d['ts']}]  {d['env']}/{d['status']}"
                     f"  eq=${d['equity']:.4f}"
                     f"  pos={d['open_positions']}"
                     f"  promo={d['promo_cycles']}"
                     f"  age={d['cycle_age_s']}s"
+                    f"  health={health}"
                     + (f"  {flag_str}" if flag_str else "")
                 )
+                # Print actionable doctor findings inline so the on-call agent sees the fix.
+                for f in findings:
+                    if f.get("escalated") or (f.get("severity") in ("warn", "critical") and not f.get("auto_fixed")):
+                        rec = f.get("recommendation")
+                        typer.echo(f"           ⚕ {f['check']} [{f['severity']}]: {f['detail']}")
+                        if rec:
+                            typer.echo(f"             → {rec}")
+                    elif f.get("auto_fixed"):
+                        typer.echo(f"           ✓ {f['check']}: {f.get('fix_action')}")
 
             elapsed = asyncio.get_event_loop().time() - t0
             await asyncio.sleep(max(0.0, interval - elapsed))
