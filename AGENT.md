@@ -158,10 +158,34 @@ If equity is 0, the wallet balance hasn't been fetched yet — wait one cycle (6
 
 ---
 
+## Step 6b — Start Making Trades (staged cutover)
+
+The system boots in `shadow` mode (paper only — no real orders). Advance through the safety ladder deliberately:
+
+```bash
+# Stage 1: prove it on testnet with real fills (fake money, real execution)
+bybit cutover testnet_live
+# → the loop now places real orders against testnet; fills feed the promotion gate
+
+# Watch for auto-promotion (fires when: ≥72 cycles, win≥50%, Sharpe≥0.5, DD≤5%)
+bybit status --json   # check "env" field for "mainnet" after criteria pass
+
+# Stage 2: flip to real money (requires confirmation unless --force)
+bybit cutover mainnet_live
+
+# Emergency rollback to paper at any time (takes effect in ≤60 s)
+bybit cutover shadow
+```
+
+**Before `mainnet_live`:** verify your Bybit API key has **Read + Trade only** (NO Withdraw).
+The repo never calls Withdraw — but the key permission is your last line of defence.
+
+---
+
 ## The Recurring Session Job (do this every time you return)
 
 ```bash
-bybit status                            # equity, drawdown, kill flag
+bybit status                            # equity, drawdown, kill flag, trading mode
 bybit events --json                     # list all pending events
 bybit event <UUID> --json               # read each event's full context
 bybit decide <UUID> --action approve    # approve a signal (ambiguous_decision)

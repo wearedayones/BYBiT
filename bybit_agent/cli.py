@@ -905,6 +905,70 @@ def resume() -> None:
 
 
 @app.command()
+def cutover(
+    mode: Annotated[str, typer.Argument(help="shadow | testnet_live | mainnet_live")],
+    force: Annotated[bool, typer.Option("--force", help="Skip confirmation for mainnet_live")] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Switch the trading execution mode at runtime (no restart needed).
+
+    \b
+    shadow       — paper mode, no real orders (safe default)
+    testnet_live — real orders on testnet; fills feed the promotion gate
+    mainnet_live — real orders on mainnet (real money)
+
+    The loop reads this every cycle so the change takes effect within 60 seconds.
+    """
+    _VALID = {"shadow", "testnet_live", "mainnet_live"}
+    if mode not in _VALID:
+        typer.echo(f"❌ Invalid mode '{mode}'. Choose: {', '.join(sorted(_VALID))}", err=True)
+        raise typer.Exit(1)
+
+    if mode == "mainnet_live" and not force:
+        typer.echo(
+            "\n⚠️  MAINNET LIVE MODE — real money will be at risk on the next cycle.\n"
+            "   Ensure you have:\n"
+            "   • A mainnet Bybit API key (Read + Trade only — NO Withdraw)\n"
+            "   • Sufficient capital and tested strategy weights\n"
+            "   • Telegram alerts configured to monitor risk events\n"
+        )
+        if not typer.confirm("Proceed to mainnet_live?", default=False):
+            typer.echo("Aborted.")
+            raise typer.Exit(0)
+
+    async def _run() -> None:
+        db = await _get_db()
+        current_rows = await db.fetch(
+            "SELECT trading_mode FROM agent_state WHERE id = 'singleton' LIMIT 1"
+        )
+        current = (current_rows[0].get("trading_mode") if current_rows else None) or "shadow"
+        new_env = "mainnet" if mode == "mainnet_live" else "testnet"
+        await db.execute(
+            """UPDATE agent_state
+               SET trading_mode = $1, env = $2, updated_at = now()
+               WHERE id = 'singleton'""",
+            mode, new_env,
+        )
+        try:
+            from .control.brain import add_note
+            await add_note(db, f"Trading mode switched: {current} → {mode}", category="directive")
+        except Exception:
+            pass
+        if as_json:
+            _print_json({"previous": current, "current": mode})
+        else:
+            icons = {"shadow": "🔵", "testnet_live": "🟡", "mainnet_live": "🟢"}
+            typer.echo(
+                f"{icons.get(mode, '⚙️')}  Trading mode: {current} → {mode}\n"
+                f"   Takes effect within one loop cycle (~60 s)."
+            )
+        if mode == "mainnet_live":
+            typer.echo("🔴 REAL MONEY IS NOW LIVE. Monitor Telegram alerts closely.")
+
+    asyncio.run(_run())
+
+
+@app.command()
 def kill(
     reason: Annotated[str, typer.Option("--reason", help="Reason for the kill")] = "Manual CLI kill",
     force: Annotated[bool, typer.Option("--force", help="Skip confirmation prompt")] = False,

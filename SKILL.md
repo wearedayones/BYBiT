@@ -84,6 +84,27 @@ The CLI is a **read + tune surface only** — it never places orders directly.
 | `bybit pause` | Set agent status = 'paused' (loop skips cycles) |
 | `bybit resume` | Set agent status = 'running' |
 | `bybit kill [--reason TEXT] [--force]` | Cancel all orders + flatten all positions + halt |
+| `bybit cutover <mode> [--force] [--json]` | Switch trading execution mode (see below) |
+
+### Trading Execution Mode (`bybit cutover`)
+
+The three modes form a one-way safety ladder. Start at `shadow`, prove on testnet, then go live.
+
+| Mode | Orders? | API | Promotion gate feeds? |
+|---|---|---|---|
+| `shadow` | None — paper only (default) | testnet | No |
+| `testnet_live` | Real testnet orders | testnet | ✅ Yes |
+| `mainnet_live` | Real mainnet orders 💰 | mainnet | — (already live) |
+
+```bash
+bybit cutover testnet_live          # step 1: start earning real testnet fills
+bybit cutover mainnet_live          # step 2: real money (requires confirmation; auto-promoted OR manual)
+bybit cutover shadow                # emergency rollback to paper mode at any time
+```
+
+`mainnet_live` always prompts for confirmation unless `--force` is passed. The change takes
+effect within one loop cycle (~60 s). The promotion gate auto-advances `testnet_live` →
+`mainnet_live` when: ≥72 cycles, win-rate ≥50%, Sharpe ≥0.5, max-drawdown ≤5%.
 
 ### Event Queue (AI drain loop)
 

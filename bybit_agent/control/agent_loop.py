@@ -125,8 +125,13 @@ class AgentLoop:
             log.info("Agent paused — skipping cycle")
             return
 
-        current_env = (ag or {}).get("env", "testnet")
-        is_testnet = current_env == "testnet"
+        # ── 1b. Read trading mode — drives paper flag and API target ──────────
+        # shadow       → paper=True,  testnet API  (default; no real orders ever)
+        # testnet_live → paper=False, testnet API  (real fills; feeds promotion gate)
+        # mainnet_live → paper=False, mainnet API  (real money)
+        mode = await self._get_trading_mode()
+        is_testnet = (mode != "mainnet_live")
+        self._decisions.paper = (mode == "shadow")
         self._client.set_testnet(is_testnet)
 
         # Read configured leverage (agent can change at runtime via `bybit tune`)
@@ -405,6 +410,21 @@ class AgentLoop:
         await self._db.execute(
             "UPDATE agent_state SET last_cycle_at = now(), updated_at = now() WHERE id = 'singleton'"
         )
+
+    async def _get_trading_mode(self) -> str:
+        """Read trading_mode from agent_state. Safe default is 'shadow'."""
+        _VALID = {"shadow", "testnet_live", "mainnet_live"}
+        try:
+            rows = await self._db.fetch(
+                "SELECT trading_mode FROM agent_state WHERE id = 'singleton' LIMIT 1"
+            )
+            if rows:
+                v = (rows[0].get("trading_mode") or "shadow").strip()
+                if v in _VALID:
+                    return v
+        except Exception:
+            pass
+        return "shadow"
 
     async def _get_configured_leverage(self) -> int:
         try:

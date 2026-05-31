@@ -53,6 +53,10 @@ class DecisionEngine:
     def paper(self) -> bool:
         return self._paper
 
+    @paper.setter
+    def paper(self, value: bool) -> None:
+        self._paper = value
+
     async def run(self, snapshots, cycle_id: str) -> list[WeightedSignal]:
         db = get_db()
 
