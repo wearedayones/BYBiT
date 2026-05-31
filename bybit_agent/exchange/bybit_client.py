@@ -355,6 +355,13 @@ class BybitClient:
             resp = await self._http.post(url, headers=headers, content=json_body)
             rate_limiter.update_from_headers(self._headers_to_dict(resp), path)
             body = resp.json()
+            # Grid/bot endpoints return standard V5 retCode, not legacy status_code.
+            if "retCode" in body:
+                rc = body["retCode"]
+                if rc != 0:
+                    raise BotApiError(rc, body.get("retMsg", ""), path)
+                return body.get("result", {})
+            # Legacy bot API format fallback.
             sc = body.get("status_code")
             if sc == 503:
                 raise BotApiError(503, "Active investment cycle — retry later", path)
@@ -362,6 +369,6 @@ class BybitClient:
                 raise BotApiError(421, "Account ban status", path)
             if sc != 200:
                 raise BotApiError(sc, body.get("debug_msg", ""), path)
-            return body["result"]
+            return body.get("result", {})
 
         return await self._tls_retry(lambda: rate_limiter.schedule_post(call))
