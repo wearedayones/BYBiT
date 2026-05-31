@@ -1961,5 +1961,281 @@ def brain(
     asyncio.run(_run())
 
 
+# ── do (natural-language intent → actions) ───────────────────────────────────
+
+_ALL_STRATEGIES = ["trend_momentum", "mean_reversion", "breakout", "funding_harvest",
+                   "crowded_positioning", "dca", "grid"]
+
+_STRATEGY_ALIASES: dict[str, str] = {
+    # grid
+    "grid": "grid", "spot grid": "grid", "spot_grid": "grid", "grid bot": "grid",
+    "spot grid bot": "grid",
+    # dca
+    "dca": "dca", "dca bot": "dca", "dollar cost": "dca",
+    # signal strategies
+    "trend": "trend_momentum", "trend momentum": "trend_momentum",
+    "momentum": "trend_momentum",
+    "mean reversion": "mean_reversion", "mean_reversion": "mean_reversion",
+    "reversion": "mean_reversion",
+    "breakout": "breakout",
+    "funding": "funding_harvest", "funding harvest": "funding_harvest",
+    "funding_harvest": "funding_harvest",
+    "crowded": "crowded_positioning", "crowd": "crowded_positioning",
+    "crowded positioning": "crowded_positioning",
+}
+
+_MODE_ALIASES: dict[str, str] = {
+    "shadow": "shadow", "paper": "shadow", "paper mode": "shadow", "paper trading": "shadow",
+    "sim": "shadow", "simulation": "shadow",
+    "testnet": "testnet_live", "test net": "testnet_live", "testnet live": "testnet_live",
+    "live testnet": "testnet_live", "live test": "testnet_live",
+    "mainnet": "mainnet_live", "main net": "mainnet_live", "mainnet live": "mainnet_live",
+    "live": "mainnet_live", "real money": "mainnet_live", "production": "mainnet_live",
+}
+
+
+def _parse_intent(instruction: str) -> list[tuple[str, ...]]:
+    """
+    Parse a plain-English instruction into a list of (command, *args) tuples.
+    Returns a list of actions to execute in order.
+    """
+    raw = instruction.lower().strip().rstrip(".")
+    actions: list[tuple[str, ...]] = []
+
+    # ── pause / stop ─────────────────────────────────────────────────────────
+    if any(w in raw for w in ["pause", "stop trading", "halt", "freeze"]):
+        actions.append(("pause",))
+        return actions
+
+    # ── resume ───────────────────────────────────────────────────────────────
+    if any(w in raw for w in ["resume", "unpause", "restart trading", "start trading"]):
+        actions.append(("resume",))
+        return actions
+
+    # ── kill ─────────────────────────────────────────────────────────────────
+    if any(w in raw for w in ["kill", "emergency", "flatten", "close all"]):
+        actions.append(("kill",))
+        return actions
+
+    # ── "run only X" / "only use X" — checked BEFORE mode so compound phrases
+    #    like "run live testnet only on grid" resolve to strategy first ────────
+    only_match = None
+    for phrase, strat in sorted(_STRATEGY_ALIASES.items(), key=lambda x: -len(x[0])):
+        if phrase in raw:
+            only_match = strat
+            break
+
+    is_only = any(w in raw for w in ["only", "just", "exclusively", "solely", "single"])
+    is_run = any(w in raw for w in ["run", "use", "switch", "enable", "activate", "start"])
+    is_disable = any(w in raw for w in ["disable", "turn off", "deactivate", "stop", "remove"])
+
+    if only_match and is_only and is_run:
+        # If a mode is also mentioned, cutover first.
+        for phrase, mode in sorted(_MODE_ALIASES.items(), key=lambda x: -len(x[0])):
+            if phrase in raw:
+                actions.append(("cutover", mode))
+                break
+        # Disable all other strategies, enable just this one.
+        for s in _ALL_STRATEGIES:
+            if s != only_match:
+                actions.append(("weights_disable", s))
+        actions.append(("weights_enable", only_match))
+        return actions
+
+    if only_match and is_disable:
+        actions.append(("weights_disable", only_match))
+        return actions
+
+    if only_match and is_run:
+        actions.append(("weights_enable", only_match))
+        return actions
+
+    # ── mode cutover (no strategy qualifier) ─────────────────────────────────
+    for phrase, mode in sorted(_MODE_ALIASES.items(), key=lambda x: -len(x[0])):
+        if phrase in raw and any(w in raw for w in ["switch", "cutover", "go to", "use", "mode", "run"]):
+            actions.append(("cutover", mode))
+            return actions
+
+    # ── "enable all strategies" ───────────────────────────────────────────────
+    if "enable all" in raw or "turn on all" in raw or "all strategies" in raw:
+        for s in _ALL_STRATEGIES:
+            actions.append(("weights_enable", s))
+        return actions
+
+    # ── risk level ────────────────────────────────────────────────────────────
+    if any(w in raw for w in ["conservative", "safe", "lower risk", "reduce risk", "less risk"]):
+        actions.append(("tune", "maxRiskPct", "0.008"))
+        actions.append(("tune", "confidenceFloor", "0.55"))
+        return actions
+
+    if any(w in raw for w in ["aggressive", "higher risk", "more risk", "increase risk"]):
+        actions.append(("tune", "maxRiskPct", "0.025"))
+        actions.append(("tune", "confidenceFloor", "0.40"))
+        return actions
+
+    # ── status / report ───────────────────────────────────────────────────────
+    if any(w in raw for w in ["status", "how is", "how's", "what is", "report", "pnl", "p&l",
+                               "profit", "positions", "trades", "performance"]):
+        actions.append(("status_report",))
+        return actions
+
+    return []  # unrecognised
+
+
+async def _exec_intent_actions(actions: list[tuple[str, ...]], db, as_json: bool) -> list[dict]:
+    results = []
+    for action in actions:
+        cmd = action[0]
+        if cmd == "pause":
+            await db.execute(
+                "UPDATE agent_state SET status = 'paused', updated_at = now() WHERE id = 'singleton'"
+            )
+            results.append({"action": "pause", "result": "loop paused"})
+        elif cmd == "resume":
+            await db.execute(
+                "UPDATE agent_state SET status = 'running', updated_at = now() WHERE id = 'singleton'"
+            )
+            results.append({"action": "resume", "result": "loop resumed"})
+        elif cmd == "kill":
+            results.append({"action": "kill", "result": "use `bybit kill --reason <reason>` for safety — this requires a reason"})
+        elif cmd == "cutover":
+            mode = action[1]
+            env = "mainnet" if mode == "mainnet_live" else "testnet"
+            await db.execute(
+                "UPDATE agent_state SET trading_mode = $1, env = $2, updated_at = now() WHERE id = 'singleton'",
+                mode, env,
+            )
+            results.append({"action": "cutover", "mode": mode, "env": env})
+        elif cmd == "weights_enable":
+            strat = action[1]
+            await db.execute(
+                """INSERT INTO strategy_weights (strategy, weight, enabled)
+                   VALUES ($1, 1.0, true)
+                   ON CONFLICT (strategy) DO UPDATE SET enabled = true, updated_at = now()""",
+                strat,
+            )
+            results.append({"action": "enable", "strategy": strat})
+        elif cmd == "weights_disable":
+            strat = action[1]
+            rows = await db.fetch("SELECT enabled FROM strategy_weights WHERE strategy = $1", strat)
+            if rows:
+                await db.execute(
+                    "UPDATE strategy_weights SET enabled = false, updated_at = now() WHERE strategy = $1",
+                    strat,
+                )
+            results.append({"action": "disable", "strategy": strat})
+        elif cmd == "tune":
+            key, val = action[1], action[2]
+            try:
+                from .config.tuning import validate_param
+                v = validate_param(key, float(val))
+                await db.execute(
+                    """INSERT INTO agent_config (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()""",
+                    key, v,
+                )
+                results.append({"action": "tune", "key": key, "value": v})
+            except Exception as e:
+                results.append({"action": "tune", "key": key, "error": str(e)})
+        elif cmd == "status_report":
+            rows = await db.fetch("SELECT * FROM agent_state WHERE id = 'singleton' LIMIT 1")
+            ag = rows[0] if rows else {}
+            pos_rows = await db.fetch("SELECT COUNT(*) as cnt FROM orders WHERE is_paper = false AND status IS DISTINCT FROM 'closed'")
+            results.append({
+                "action": "status",
+                "trading_mode": ag.get("trading_mode"),
+                "equity": float(ag.get("equity") or 0),
+                "drawdown_pct": float(ag.get("drawdown_pct") or 0),
+                "kill_engaged": ag.get("kill_engaged"),
+            })
+    return results
+
+
+@app.command()
+def do(
+    instruction: Annotated[str, typer.Argument(help="Plain-English instruction, e.g. 'run only spot grid bot'")],
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would happen without executing")] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Execute a plain-English instruction.
+
+    Examples:
+      bybit do "run only spot grid bot"
+      bybit do "disable funding harvest"
+      bybit do "switch to conservative mode"
+      bybit do "go to testnet live"
+      bybit do "enable all strategies"
+      bybit do "pause"
+    """
+
+    async def _run() -> None:
+        actions = _parse_intent(instruction)
+        if not actions:
+            msg = (
+                f"Could not parse: '{instruction}'\n\n"
+                "Understood patterns:\n"
+                "  run only <strategy>     — disable all others, enable one\n"
+                "  enable/disable <strategy>\n"
+                "  enable all strategies\n"
+                "  go to shadow / testnet live / mainnet\n"
+                "  pause / resume\n"
+                "  conservative / aggressive\n"
+                "  status / report\n\n"
+                "Strategies: trend_momentum, mean_reversion, breakout,\n"
+                "            funding_harvest, crowded_positioning, grid, dca"
+            )
+            if as_json:
+                _print_json({"error": "unrecognised", "instruction": instruction})
+            else:
+                typer.echo(f"❓ {msg}")
+            raise typer.Exit(1)
+
+        if dry_run:
+            if as_json:
+                _print_json({"dry_run": True, "actions": [list(a) for a in actions]})
+            else:
+                typer.echo(f"[dry-run] Would execute {len(actions)} action(s):")
+                for a in actions:
+                    typer.echo(f"  → {' '.join(a)}")
+            return
+
+        db = await _get_db()
+        try:
+            results = await _exec_intent_actions(actions, db, as_json)
+        finally:
+            from .persistence.db import close_db
+            await close_db()
+
+        if as_json:
+            _print_json({"results": results})
+        else:
+            for r in results:
+                action = r.get("action")
+                if action == "pause":
+                    typer.echo("⏸  Loop paused.")
+                elif action == "resume":
+                    typer.echo("▶️  Loop resumed.")
+                elif action == "cutover":
+                    typer.echo(f"🔀 Switched to {r['mode']} ({r['env']}). Takes effect next cycle (~60s).")
+                elif action == "enable":
+                    typer.echo(f"✅ Enabled: {r['strategy']}")
+                elif action == "disable":
+                    typer.echo(f"⛔ Disabled: {r['strategy']}")
+                elif action == "tune":
+                    if "error" in r:
+                        typer.echo(f"⚠️  {r['key']}: {r['error']}")
+                    else:
+                        typer.echo(f"🎛  {r['key']} = {r['value']}")
+                elif action == "status":
+                    typer.echo(
+                        f"📊 {r['trading_mode']} | equity=${r['equity']:.2f} | "
+                        f"dd={r['drawdown_pct']:.2f}% | kill={r['kill_engaged']}"
+                    )
+                elif action == "kill":
+                    typer.echo(f"⚠️  {r['result']}")
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     app()
