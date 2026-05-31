@@ -183,7 +183,10 @@ class ExecutionRouter:
     def _maker_limit_price(self, side: str, ref_price: float) -> float:
         off = EXECUTION_DEFAULTS["MAKER_OFFSET_PCT"]
         raw = ref_price * (1 - off) if side == "Buy" else ref_price * (1 + off)
-        return round(raw, 2)
+        # Use 6 d.p. — round(raw, 2) catastrophically over-rounds low-priced tokens
+        # (e.g. HBAR 0.09510 → 0.10, a 5% error that invalidates stop loss params).
+        # Proper tick-size rounding is handled server-side by Bybit.
+        return round(raw, 6)
 
 
 def _order_link_id(o: Any) -> str | None:

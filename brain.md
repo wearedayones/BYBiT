@@ -9,7 +9,7 @@
 > Python loop trades 24/7; you (the AI) wake via the event queue to review, tune, and
 > document — never in the hot path.
 
-_Last rendered: 2026-05-31 17:07 UTC_
+_Last rendered: 2026-05-31 17:45 UTC_
 
 ---
 ## 🎯 1. Account State
@@ -18,13 +18,13 @@ _Last rendered: 2026-05-31 17:07 UTC_
 | Environment | `testnet` |
 | Status | `running` |
 | Kill switch | 🟢 clear |
-| Equity | `78.3899` |
-| Peak equity | `78.3911` |
-| Drawdown | `0.00%` |
+| Equity | `78.2594` |
+| Peak equity | `78.3966` |
+| Drawdown | `0.17%` |
 | Daily realized P&L | `0` |
 | Max risk / trade | `0.015` |
-| Promotion cycles | `276` |
-| Last cycle | `2026-05-31 17:07:20.377862+00` |
+| Promotion cycles | `292` |
+| Last cycle | `2026-05-31 17:45:01.644992+00` |
 
 ## 📊 2. Trade Performance (closed)
 _No closed trades yet — paper simulation will populate this._
@@ -56,6 +56,7 @@ _No learned priors yet — accumulates as trades close._
 ## 🪵 7. Lessons & Decision Ledger
 
 ### Active Directives
+- _2026-05-31 17:26_ — Trading mode switched: shadow → testnet_live
 - _2026-05-31 12:44_ — Soak phase: paper simulation now closes trades to feed the learning loop + promotion gate. Favor trend_momentum/funding_harvest; trim mean_reversion in vol spikes.
 
 ---

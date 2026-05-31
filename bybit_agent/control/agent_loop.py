@@ -274,15 +274,21 @@ class AgentLoop:
                     sym_abbr   = sig.symbol[:12]
                     order_link_id = f"ag-{strat_abbr}-{sym_abbr}-{int(time.time())}"[:45]
                     ref_price = sig.suggestedEntry or snap.lastPrice
-                    # Validate stop loss direction against current price — signal may be stale.
+                    # Fetch a fresh price so stop validation uses the actual current price,
+                    # not the snapshot which can be up to 5 min stale.
+                    try:
+                        fresh = await self._client.get_ticker("linear", sig.symbol)
+                        cur = float(fresh["lastPrice"]) if fresh else snap.lastPrice
+                    except Exception:
+                        cur = snap.lastPrice
                     raw_stop = approval.stopPrice or None
                     if raw_stop:
-                        if side == "Sell" and raw_stop <= ref_price:
-                            raw_stop = ref_price * 1.02  # 2% above entry for shorts
-                        elif side == "Buy" and raw_stop >= ref_price:
-                            raw_stop = ref_price * 0.98  # 2% below entry for longs
+                        if side == "Sell" and raw_stop <= cur:
+                            raw_stop = cur * 1.02  # 2% above live price for shorts
+                        elif side == "Buy" and raw_stop >= cur:
+                            raw_stop = cur * 0.98  # 2% below live price for longs
                     await self._client.set_leverage("linear", sig.symbol, self._leverage)
-                    result = await self._execution.enter(EnterParams(
+                    enter_params = EnterParams(
                         category="linear",
                         symbol=sig.symbol,
                         side=side,
@@ -291,7 +297,29 @@ class AgentLoop:
                         stopLoss=raw_stop,
                         takeProfit=approval.tpPrice,
                         orderLinkId=order_link_id,
-                    ))
+                    )
+                    try:
+                        result = await self._execution.enter(enter_params)
+                    except Exception as sl_err:
+                        # Bybit error 10001 with "StopLoss" = stop is on the wrong side
+                        # of their internal mark price (common on testnet with stale prices).
+                        # Retry without stopLoss — position manager will set it post-fill.
+                        if "10001" in str(sl_err) and "StopLoss" in str(sl_err):
+                            log.warning("Stop loss rejected by exchange, retrying without SL",
+                                        symbol=sig.symbol, stop=raw_stop, error=str(sl_err)[:80])
+                            enter_params = EnterParams(
+                                category="linear",
+                                symbol=sig.symbol,
+                                side=side,
+                                qty=approval.qty,
+                                refPrice=ref_price,
+                                stopLoss=None,
+                                takeProfit=approval.tpPrice,
+                                orderLinkId=order_link_id + "b",
+                            )
+                            result = await self._execution.enter(enter_params)
+                        else:
+                            raise
                     import json
                     await self._db.execute(
                         """INSERT INTO orders
