@@ -9,7 +9,7 @@
 > Python loop trades 24/7; you (the AI) wake via the event queue to review, tune, and
 > document — never in the hot path.
 
-_Last rendered: 2026-05-31 19:02 UTC_
+_Last rendered: 2026-05-31 19:33 UTC_
 
 ---
 ## 🎯 1. Account State
@@ -18,13 +18,13 @@ _Last rendered: 2026-05-31 19:02 UTC_
 | Environment | `testnet` |
 | Status | `running` |
 | Kill switch | 🟢 clear |
-| Equity | `78.2026` |
-| Peak equity | `78.4735` |
-| Drawdown | `0.35%` |
+| Equity | `78.4571` |
+| Peak equity | `78.4769` |
+| Drawdown | `0.03%` |
 | Daily realized P&L | `0` |
 | Max risk / trade | `0.015` |
-| Promotion cycles | `345` |
-| Last cycle | `2026-05-31 19:02:31.730941+00` |
+| Promotion cycles | `372` |
+| Last cycle | `2026-05-31 19:33:04.807007+00` |
 
 ## 📊 2. Trade Performance (closed)
 _No closed trades yet — paper simulation will populate this._
