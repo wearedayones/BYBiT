@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bybit-agent"
+version = "2.0.0"
+description = "Autonomous, agent-operated Bybit trading skill — deterministic 24/7 engine + CLI surface any AI agent drives"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",            # async HTTP for Bybit REST + Neon HTTP + Telegram
+    "cryptography>=42",       # RSA-SHA256 signing (PKCS#1 v1.5) for AI sub-account keys
+    "pydantic>=2.7",          # env / config validation (mirrors the old Zod schema)
+    "pydantic-settings>=2.3", # .env loading + settings model
+    "structlog>=24.1",        # structured JSON logging with secret redaction
+    "typer>=0.12",            # the `bybit ...` CLI surface
+    "numpy>=1.26",            # indicator math (hand-ported, parity to TS)
+    "aiolimiter>=1.1",        # async rate-limit lanes (GET/POST)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+# Only usable where Postgres TCP (5432/6543) is reachable — NOT the default cloud path.
+tcp = ["psycopg[binary]>=3.1"]
+
+[project.scripts]
+bybit = "bybit_agent.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["bybit_agent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
