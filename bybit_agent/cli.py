@@ -65,6 +65,19 @@ async def _get_db():
     return get_db()
 
 
+async def _is_testnet(db=None) -> bool:
+    """Read trading_mode from agent_state to determine the active API target."""
+    try:
+        _db = db or await _get_db()
+        rows = await _db.fetch(
+            "SELECT trading_mode FROM agent_state WHERE id = 'singleton' LIMIT 1"
+        )
+        mode = (rows[0].get("trading_mode") if rows else None) or "shadow"
+        return mode != "mainnet_live"
+    except Exception:
+        return True  # testnet is the safe default
+
+
 # ── migrate ──────────────────────────────────────────────────────────────────
 
 @app.command()
@@ -286,7 +299,7 @@ def positions(
 
         env = get_env()
         auth = resolve_bybit_auth(env)
-        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        client = BybitClient(auth, is_testnet=await _is_testnet())
         try:
             pos_list = await client.get_positions("linear")
             open_pos = [p for p in pos_list if float(p.get("size", 0)) > 0]
@@ -1000,7 +1013,7 @@ def kill(
 
         env = get_env()
         auth = resolve_bybit_auth(env)
-        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        client = BybitClient(auth, is_testnet=await _is_testnet())
         db = await _get_db()
         ks = KillSwitch(client, db)
         try:
@@ -1487,7 +1500,7 @@ def executions(
 
         env = get_env()
         auth = resolve_bybit_auth(env)
-        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        client = BybitClient(auth, is_testnet=await _is_testnet())
         try:
             fills = await client.get_executions("linear", symbol=symbol, limit=limit)
         finally:
@@ -1530,7 +1543,7 @@ def algo_list(
 
         env = get_env()
         auth = resolve_bybit_auth(env)
-        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        client = BybitClient(auth, is_testnet=await _is_testnet())
         try:
             orders = await client.list_algo_orders("UTA_USDT", symbol=symbol)
         finally:
@@ -1675,7 +1688,7 @@ def pl(
 
         env = get_env()
         auth = resolve_bybit_auth(env)
-        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        client = BybitClient(auth, is_testnet=await _is_testnet())
         try:
             pos_list = await client.get_positions("linear")
             open_pos = [p for p in pos_list if float(p.get("size", 0)) > 0]
@@ -1753,7 +1766,7 @@ def signal(
 
         env = get_env()
         auth = resolve_bybit_auth(env)
-        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        client = BybitClient(auth, is_testnet=await _is_testnet())
         try:
             svc = MarketDataService(client)
             snap = await svc.get_snapshot(symbol.upper(), category)
