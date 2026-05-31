@@ -72,9 +72,11 @@ class AgentLoop:
         self._bots = BotManager(client, db, is_testnet)
         self._copy = CopyTradingManager(client, db, is_paper=is_testnet)
 
-        self._last_daily_report = 0.0
-        self._last_weekly_report = 0.0
-        self._last_monthly_report = 0.0
+        # Initialised to now; overwritten from DB in start() so restarts don't re-send reports.
+        _now = time.time() * 1000
+        self._last_daily_report = _now
+        self._last_weekly_report = _now
+        self._last_monthly_report = _now
         self._last_repo_check = 0.0
         self._last_discovery = 0.0
         self._last_brain_render = 0.0
@@ -97,6 +99,32 @@ class AgentLoop:
     async def start(self) -> None:
         self._running = True
         log.info("Agent loop starting", testnet=self._is_testnet)
+
+        # Restore last-report timestamps from DB so restarts don't re-fire reports.
+        try:
+            ts_rows = await self._db.fetch(
+                """SELECT last_daily_report_at, last_weekly_report_at, last_monthly_report_at
+                   FROM agent_state WHERE id = 'singleton' LIMIT 1"""
+            )
+            if ts_rows:
+                r = ts_rows[0]
+                _epoch_ms = time.time() * 1000
+                def _ts_to_ms(col: str) -> float:
+                    v = r.get(col)
+                    if v is None:
+                        return 0.0
+                    if hasattr(v, "timestamp"):
+                        return v.timestamp() * 1000
+                    from datetime import datetime, timezone
+                    try:
+                        return datetime.fromisoformat(str(v)).replace(tzinfo=timezone.utc).timestamp() * 1000
+                    except Exception:
+                        return 0.0
+                self._last_daily_report   = _ts_to_ms("last_daily_report_at")   or _epoch_ms
+                self._last_weekly_report  = _ts_to_ms("last_weekly_report_at")  or _epoch_ms
+                self._last_monthly_report = _ts_to_ms("last_monthly_report_at") or _epoch_ms
+        except Exception as e:
+            log.warning("Could not restore report timestamps (non-fatal)", error=str(e))
 
         # Rebuild live position tracking from exchange + orders table on restart.
         try:
@@ -431,17 +459,26 @@ class AgentLoop:
             except Exception as e:
                 log.warning("Promotion check failed", error=str(e))
 
-        # ── 8. Reports (Phase 5 will wire ReportBuilder) ───────────────────
+        # ── 8. Reports ─────────────────────────────────────────────────────
         now = time.time() * 1000
+        _report_update: dict[str, str] = {}
         if now - self._last_daily_report > 24 * 60 * 60 * 1000:
             self._last_daily_report = now
+            _report_update["last_daily_report_at"] = "now()"
             asyncio.create_task(self._send_report("daily"))
         if now - self._last_weekly_report > 7 * 24 * 60 * 60 * 1000:
             self._last_weekly_report = now
+            _report_update["last_weekly_report_at"] = "now()"
             asyncio.create_task(self._send_report("weekly"))
         if now - self._last_monthly_report > 30 * 24 * 60 * 60 * 1000:
             self._last_monthly_report = now
+            _report_update["last_monthly_report_at"] = "now()"
             asyncio.create_task(self._send_report("monthly"))
+        if _report_update:
+            cols = ", ".join(f"{k} = {v}" for k, v in _report_update.items())
+            await self._db.execute(
+                f"UPDATE agent_state SET {cols} WHERE id = 'singleton'"
+            )
 
         # ── 8b. brain.md auto-render ────────────────────────────────────────
         if now - self._last_brain_render > BRAIN_RENDER_INTERVAL_MS:
