@@ -9,7 +9,7 @@
 > Python loop trades 24/7; you (the AI) wake via the event queue to review, tune, and
 > document — never in the hot path.
 
-_Last rendered: 2026-05-31 18:16 UTC_
+_Last rendered: 2026-05-31 18:34 UTC_
 
 ---
 ## 🎯 1. Account State
@@ -18,13 +18,13 @@ _Last rendered: 2026-05-31 18:16 UTC_
 | Environment | `testnet` |
 | Status | `running` |
 | Kill switch | 🟢 clear |
-| Equity | `78.4253` |
-| Peak equity | `78.4265` |
-| Drawdown | `0.00%` |
+| Equity | `78.2541` |
+| Peak equity | `78.4735` |
+| Drawdown | `0.28%` |
 | Daily realized P&L | `0` |
 | Max risk / trade | `0.015` |
-| Promotion cycles | `310` |
-| Last cycle | `2026-05-31 18:16:35.399817+00` |
+| Promotion cycles | `326` |
+| Last cycle | `2026-05-31 18:34:29.447914+00` |
 
 ## 📊 2. Trade Performance (closed)
 _No closed trades yet — paper simulation will populate this._
@@ -32,17 +32,15 @@ _No closed trades yet — paper simulation will populate this._
 ## 📥 3. Pending Event Queue
 | Kind | Sev | Symbol | Title | Expires |
 |---|---|---|---|---|
-| scheduled_review | info | — | Daily strategy review due | 2026-06-02 17:07:10.056525+00 |
-| market_event | warning | ETHUSDT | Market event: vol_spike on ETHUSDT | 2026-05-31 07:38:51.425566+00 |
-| market_event | warning | ETHUSDT | Market event: price_spike on ETHUSDT | 2026-05-31 07:38:51.375396+00 |
-| market_event | warning | BTCUSDT | Market event: vol_spike on BTCUSDT | 2026-05-31 07:38:50.145925+00 |
+| scheduled_review | info | — | Daily strategy review due | 2026-06-02 18:34:17.835455+00 |
 
 ## ⚙️ 4. Live Strategy Weights
 | Strategy | Weight | On | Win rate | 48h win | Trades |
 |---|---|---|---|---|---|
 | funding_harvest | 1.2 | ✅ | None | None | 0 |
-| trend_momentum | 1.0 | ✅ | None | None | 0 |
 | mean_reversion | 1.0 | ✅ | None | None | 0 |
+| trend_momentum | 1.0 | ✅ | None | None | 0 |
+| crowded_positioning | 1.0 | ✅ | None | None | 0 |
 | grid | 0.9 | ✅ | None | None | 0 |
 | dca | 0.9 | ✅ | None | None | 0 |
 | breakout | 0.8 | ✅ | None | None | 0 |
