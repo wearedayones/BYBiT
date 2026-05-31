@@ -829,7 +829,7 @@ def weights(
                     sys.exit(1)
                 new_enabled = not rows[0]["enabled"]
                 await db.execute(
-                    "UPDATE strategy_weights SET enabled = $1, updated_at = now() WHERE strategy = $2",
+                    "UPDATE strategy_weights SET enabled = $1 WHERE strategy = $2",
                     new_enabled, toggle,
                 )
                 typer.echo(f"✅ {toggle} {'enabled' if new_enabled else 'disabled'}")
