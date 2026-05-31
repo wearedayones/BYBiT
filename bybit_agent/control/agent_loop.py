@@ -24,8 +24,9 @@ from bybit_agent.config.constants import (
     REPO_POLL_INTERVAL_MS,
 )
 
-SIGNAL_DROUGHT_THRESHOLD = 60  # consecutive cycles with signals but no approval (~1 h)
-ADAPT_EVERY_CYCLES = 10        # run adaptive_weight_decay every N cycles
+SIGNAL_DROUGHT_THRESHOLD = 60   # consecutive cycles with signals but no approval (~1 h)
+ADAPT_EVERY_CYCLES = 10         # run adaptive_weight_decay every N cycles
+BRAIN_RENDER_INTERVAL_MS = 30 * 60 * 1000  # re-render brain.md every 30 minutes
 from bybit_agent.core.errors import KillSwitchError
 from bybit_agent.core.logger import get_logger
 from bybit_agent.exchange.bybit_client import BybitClient
@@ -75,6 +76,7 @@ class AgentLoop:
         self._last_monthly_report = 0.0
         self._last_repo_check = 0.0
         self._last_discovery = 0.0
+        self._last_brain_render = 0.0
         self._watched_symbols: list[str] = list(FALLBACK_SYMBOLS)
 
         self._no_trade_cycles: int = 0
@@ -373,6 +375,11 @@ class AgentLoop:
             self._last_monthly_report = now
             asyncio.create_task(self._send_report("monthly"))
 
+        # ── 8b. brain.md auto-render ────────────────────────────────────────
+        if now - self._last_brain_render > BRAIN_RENDER_INTERVAL_MS:
+            self._last_brain_render = now
+            asyncio.create_task(self._render_brain())
+
         # ── 9. Repo update check ────────────────────────────────────────────
         if now - self._last_repo_check > REPO_POLL_INTERVAL_MS:
             self._last_repo_check = now
@@ -505,6 +512,14 @@ class AgentLoop:
             pass
 
         return base
+
+    async def _render_brain(self) -> None:
+        try:
+            from bybit_agent.control.brain import write_file
+            path = await write_file(self._db)
+            log.debug("brain.md rendered", path=path)
+        except Exception as e:
+            log.warning("brain.md render failed", error=str(e))
 
     async def _send_report(self, period: str) -> None:
         try:
