@@ -169,6 +169,65 @@ class BybitClient:
     async def switch_position_mode(self, category: Category, symbol: str, mode: int) -> None:
         await self._private_post("/v5/position/switch-mode", {"category": category, "symbol": symbol, "mode": mode})
 
+    async def amend_order(self, category: Category, symbol: str, order_id: str, **opts: Any) -> dict[str, Any]:
+        return await self._private_post(
+            "/v5/order/amend", {"category": category, "symbol": symbol, "orderId": order_id, **opts}
+        )
+
+    async def get_order_history(self, category: Category, symbol: str | None = None, limit: int = 50) -> list[Any]:
+        qs = f"category={category}&limit={limit}"
+        if symbol:
+            qs += f"&symbol={symbol}"
+        res = await self._private_get(f"/v5/order/history?{qs}")
+        return res["list"]
+
+    async def get_executions(self, category: Category, symbol: str | None = None, limit: int = 50) -> list[Any]:
+        qs = f"category={category}&limit={limit}"
+        if symbol:
+            qs += f"&symbol={symbol}"
+        res = await self._private_get(f"/v5/execution/list?{qs}")
+        return res["list"]
+
+    async def create_batch_orders(self, category: Category, requests: list[dict[str, Any]]) -> list[Any]:
+        res = await self._private_post("/v5/order/create-batch", {"category": category, "request": requests})
+        return (res.get("result") or {}).get("list") or []
+
+    # ── Market signals ────────────────────────────────────────────────────────
+
+    async def get_open_interest(self, category: Category, symbol: str, interval: str = "1h", limit: int = 1) -> list[Any]:
+        res = await self._public_get(
+            f"/v5/market/open-interest?category={category}&symbol={symbol}&intervalTime={interval}&limit={limit}"
+        )
+        return res["list"]
+
+    async def get_long_short_ratio(self, category: Category, symbol: str, period: str = "1h", limit: int = 1) -> list[Any]:
+        res = await self._public_get(
+            f"/v5/market/account-ratio?category={category}&symbol={symbol}&period={period}&limit={limit}"
+        )
+        return res["list"]
+
+    async def get_historical_volatility(self, category: Category, symbol: str | None = None, period: int = 30) -> list[Any]:
+        qs = f"category={category}&period={period}"
+        if symbol:
+            qs += f"&symbol={symbol}"
+        res = await self._public_get(f"/v5/market/historical-volatility?{qs}")
+        return res if isinstance(res, list) else res.get("list", [])
+
+    # ── Algo (strategy) orders ────────────────────────────────────────────────
+
+    async def create_algo_order(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._private_post("/v5/strategy/create", params)
+
+    async def stop_algo_order(self, category: str, algo_order_id: str) -> None:
+        await self._private_post("/v5/strategy/stop", {"category": category, "algoOrderId": algo_order_id})
+
+    async def list_algo_orders(self, category: str, symbol: str | None = None) -> list[Any]:
+        qs = f"category={category}"
+        if symbol:
+            qs += f"&symbol={symbol}"
+        res = await self._private_get(f"/v5/strategy/list?{qs}")
+        return res.get("list") or []
+
     # ── Copy trading ──────────────────────────────────────────────────────────
     async def get_copy_leader_list(self) -> list[dict[str, Any]]:
         res = await self._public_get("/v5/copy-trade/recommend-leader-list")
@@ -192,6 +251,24 @@ class BybitClient:
 
     async def get_spot_grid_detail(self, grid_id: str) -> Any:
         return await self._bot_post("/v5/grid/query-grid-detail", {"grid_id": grid_id})
+
+    async def validate_futures_grid(self, params: dict[str, Any]) -> Any:
+        return await self._bot_post("/v5/fgridbot/validate", params)
+
+    async def create_futures_grid(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._bot_post("/v5/fgridbot/create", params)
+
+    async def close_futures_grid(self, bot_id: str) -> None:
+        await self._bot_post("/v5/fgridbot/close", {"botId": bot_id})
+
+    async def get_futures_grid_detail(self, bot_id: str) -> Any:
+        return await self._bot_post("/v5/fgridbot/detail", {"botId": bot_id})
+
+    async def create_dca_bot(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self._bot_post("/v5/dca/create-bot", params)
+
+    async def close_dca_bot(self, bot_id: str, settle_type: int = 1) -> None:
+        await self._bot_post("/v5/dca/close-bot", {"botId": bot_id, "settleType": settle_type})
 
     # ── Internal helpers ──────────────────────────────────────────────────────
     async def _tls_retry(self, fn: Callable[[], Awaitable[T]]) -> T:

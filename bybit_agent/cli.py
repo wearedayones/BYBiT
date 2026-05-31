@@ -9,6 +9,7 @@ Commands:
   run          Launch the 24/7 trading service.
   status       Show agent_state summary.
   positions    List open positions.
+  executions   Show recent trade fills from the exchange.
   report       Structured performance digest.
   events       List pending events (AI wake queue).
   event        Show one event with full context.
@@ -21,6 +22,9 @@ Commands:
   resume       Set agent status = 'running'.
   kill         Engage the kill switch (cancel-all + flatten).
   watch        Watchdog: health-check every N seconds, auto-restart if dead.
+  strategy     Strategy management (create/edit/backtest/accept/pause/…).
+  algo         Algo order management (list active TWAP/Iceberg orders).
+  skill        Official Bybit Exchange AI skill hub (list/show/refresh).
 """
 from __future__ import annotations
 
@@ -1363,6 +1367,227 @@ def strategy_bases() -> None:
     for k, cls in sorted(BASE_STRATEGIES.items()):
         regimes = ", ".join(getattr(cls, "suitable_regimes", []))
         typer.echo(f"  {k:<18} suitable_regimes=[{regimes}]")
+
+
+# ── executions ────────────────────────────────────────────────────────────────
+
+@app.command()
+def executions(
+    symbol: Annotated[Optional[str], typer.Option("--symbol")] = None,
+    limit: Annotated[int, typer.Option("--limit")] = 50,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show recent trade executions (fills) from the exchange."""
+
+    async def _run() -> None:
+        from .config.env import get_env
+        from .exchange.bybit_client import BybitClient
+        from .exchange.credentials import resolve_bybit_auth
+
+        env = get_env()
+        auth = resolve_bybit_auth(env)
+        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        try:
+            fills = await client.get_executions("linear", symbol=symbol, limit=limit)
+        finally:
+            await client.aclose()
+
+        if as_json:
+            _print_json(fills)
+            return
+        if not fills:
+            typer.echo("No recent executions.")
+            return
+        typer.echo(f"\n{'symbol':<12} {'side':<5} {'qty':>10} {'price':>12} {'fee':>10}  time")
+        for f in fills:
+            typer.echo(
+                f"{f.get('symbol','?'):<12} {f.get('side','?'):<5}"
+                f" {f.get('execQty','?'):>10} {f.get('execPrice','?'):>12}"
+                f" {f.get('execFee','?'):>10}  {str(f.get('execTime',''))[:16]}"
+            )
+
+    asyncio.run(_run())
+
+
+# ── algo ──────────────────────────────────────────────────────────────────────
+
+algo_app = typer.Typer(add_completion=False, help="Algo (TWAP/Iceberg) order management.")
+app.add_typer(algo_app, name="algo")
+
+
+@algo_app.command("list")
+def algo_list(
+    symbol: Annotated[Optional[str], typer.Option("--symbol")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """List active algo (TWAP/Iceberg/Chase/POV) orders."""
+
+    async def _run() -> None:
+        from .config.env import get_env
+        from .exchange.bybit_client import BybitClient
+        from .exchange.credentials import resolve_bybit_auth
+
+        env = get_env()
+        auth = resolve_bybit_auth(env)
+        client = BybitClient(auth, is_testnet=(env.BYBIT_ENV == "testnet"))
+        try:
+            orders = await client.list_algo_orders("UTA_USDT", symbol=symbol)
+        finally:
+            await client.aclose()
+
+        if as_json:
+            _print_json(orders)
+            return
+        if not orders:
+            typer.echo("No active algo orders.")
+            return
+        typer.echo(f"\n{'algoOrderId':<20} {'symbol':<12} {'side':<5} {'type':<10} {'qty':>10}  status")
+        for o in orders:
+            typer.echo(
+                f"{str(o.get('algoOrderId','?')):<20} {o.get('symbol','?'):<12}"
+                f" {o.get('side','?'):<5} {o.get('orderType','?'):<10}"
+                f" {str(o.get('qty','?')):>10}  {o.get('status','?')}"
+            )
+
+    asyncio.run(_run())
+
+
+# ── skill ─────────────────────────────────────────────────────────────────────
+
+skill_app = typer.Typer(add_completion=False, help="Official Bybit Exchange AI skill hub.")
+app.add_typer(skill_app, name="skill")
+
+_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+_MODULES_DIR = _SKILLS_DIR / "modules"
+
+_MODULE_DESCRIPTIONS = {
+    "market":       "Klines, tickers, open interest, L/S ratio, historical volatility",
+    "derivatives":  "Perpetual futures orders, positions, order history",
+    "spot":         "Spot orders, margin trading",
+    "account":      "Balances, transfers, sub-accounts, unified account",
+    "trading-bot":  "Spot/futures grid bots, DCA bot, martingale",
+    "strategy":     "TWAP, Iceberg, Chase, POV algorithmic execution orders",
+    "copy-trading": "Leader discovery, follower binding, copy settings",
+    "earn":         "Savings, staking, liquidity mining, flexible products",
+    "advanced":     "WebSocket streams, institutional loans, RFQ block trades",
+    "alpha-trade":  "DEX token swaps and on-chain token access",
+    "fiat":         "P2P trading, fiat conversion, bank transfers",
+    "tradfi":       "Tokenised equities, commodities, MT5 copy trading",
+}
+
+
+@skill_app.command("list")
+def skill_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List all embedded official Bybit skill modules."""
+    version = (_SKILLS_DIR / "VERSION").read_text().strip() if (_SKILLS_DIR / "VERSION").exists() else "unknown"
+    modules = []
+    for name, desc in _MODULE_DESCRIPTIONS.items():
+        path = _MODULES_DIR / f"{name}.md"
+        modules.append({
+            "module": name,
+            "description": desc,
+            "size_bytes": path.stat().st_size if path.exists() else 0,
+            "available": path.exists(),
+        })
+    if as_json:
+        _print_json({"version": version, "modules": modules})
+        return
+    typer.echo(f"Official Bybit Exchange skill hub  (embedded v{version})\n")
+    typer.echo(f"  {'MODULE':<16}  {'DESCRIPTION'}")
+    typer.echo("  " + "-" * 68)
+    for m in modules:
+        mark = "✓" if m["available"] else "✗"
+        typer.echo(f"  {mark} {m['module']:<14}  {m['description']}")
+    typer.echo(f"\nUse: bybit skill show <module>  |  bybit skill refresh")
+
+
+@skill_app.command("show")
+def skill_show(
+    module: str,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Print an official Bybit skill module (API reference for that topic)."""
+    path = _MODULES_DIR / f"{module}.md"
+    if not path.exists():
+        names = ", ".join(_MODULE_DESCRIPTIONS.keys())
+        typer.echo(f"❌ Module '{module}' not found. Available: {names}", err=True)
+        raise typer.Exit(1)
+    content = path.read_text()
+    if as_json:
+        _print_json({"module": module, "content": content})
+    else:
+        typer.echo(content)
+
+
+@skill_app.command("version")
+def skill_version(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Print the embedded skill version."""
+    version = (_SKILLS_DIR / "VERSION").read_text().strip() if (_SKILLS_DIR / "VERSION").exists() else "unknown"
+    if as_json:
+        _print_json({"embedded_version": version})
+    else:
+        typer.echo(f"Embedded official skill version: {version}")
+
+
+@skill_app.command("refresh")
+def skill_refresh(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Fetch latest official Bybit skill modules from GitHub and update skills/."""
+    import hashlib
+
+    BASE = "https://raw.githubusercontent.com/bybit-exchange/skills/main"
+    MODULE_FILES = list(_MODULE_DESCRIPTIONS.keys())
+
+    async def _run() -> dict:
+        import httpx
+        updated: list[str] = []
+        errors: list[str] = []
+
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            # Fetch VERSION first to see what we're pulling.
+            try:
+                ver_resp = await c.get(f"{BASE}/VERSION")
+                ver_resp.raise_for_status()
+                new_version = ver_resp.text.strip()
+            except Exception as e:
+                new_version = "unknown"
+                errors.append(f"VERSION: {e}")
+
+            # Fetch each module.
+            for mod in MODULE_FILES:
+                url = f"{BASE}/modules/{mod}.md"
+                try:
+                    r = await c.get(url)
+                    r.raise_for_status()
+                    dest = _MODULES_DIR / f"{mod}.md"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(r.content)
+                    updated.append(mod)
+                except Exception as e:
+                    errors.append(f"{mod}: {e}")
+
+        if new_version != "unknown":
+            (_SKILLS_DIR / "VERSION").write_text(new_version + "\n")
+
+        # Rebuild MANIFEST (SHA256 of each module).
+        manifest_lines = []
+        for mod in MODULE_FILES:
+            p = _MODULES_DIR / f"{mod}.md"
+            if p.exists():
+                h = hashlib.sha256(p.read_bytes()).hexdigest()
+                manifest_lines.append(f"{h}  modules/{mod}.md")
+        (_SKILLS_DIR / "MANIFEST").write_text("\n".join(manifest_lines) + "\n")
+
+        return {"version": new_version, "updated": updated, "errors": errors}
+
+    result = asyncio.run(_run())
+    if as_json:
+        _print_json(result)
+        return
+    typer.echo(f"✅ Refreshed {len(result['updated'])} modules (v{result['version']})")
+    if result["errors"]:
+        typer.echo("⚠️  Errors:")
+        for e in result["errors"]:
+            typer.echo(f"   {e}")
 
 
 if __name__ == "__main__":

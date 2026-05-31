@@ -70,6 +70,11 @@ PARAM_WHITELIST: dict[str, ParamSpec] = {
         "desc": "Cycles before a stale ~flat position is closed by the time exit (10–200)",
         "db_key": "max_hold_cycles",
     },
+    "algoThresholdUsdt": {
+        "min": 100, "max": 10000, "type": "float",
+        "desc": "Notional (USDT) above which TWAP routing is used instead of a single market order (100–10000)",
+        "db_key": "algo_threshold_usdt",
+    },
 }
 
 STRATEGY_NAMES = ["trend_momentum", "mean_reversion", "breakout", "funding_harvest"]

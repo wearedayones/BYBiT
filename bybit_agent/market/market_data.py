@@ -50,6 +50,8 @@ class MarketSnapshot:
     indicators: Indicators
     orderbook: dict  # {bidDepth, askDepth, imbalance}
     openInterest: float | None = None
+    longShortRatio: float | None = None   # buyRatio from /v5/market/account-ratio (0–1; >0.5 = more longs)
+    historicalVolatility: float | None = None  # from /v5/market/historical-volatility
     research: ResearchData | None = None
 
 
@@ -112,6 +114,15 @@ def classify_regime(snap: MarketSnapshot) -> Regime:
     # 8% threshold keeps normal crypto vol out of crisis; 0.002 funding = ~220% APR.
     if (atr_pct > 0.08 and adx_value < 25) or funding_abs > 0.002:
         return "crisis"
+    # Crowded positioning — contrarian signal from L/S ratio.
+    # >70% longs = crowded long (mean-reversion short setup).
+    # <30% longs = crowded short (mean-reversion long setup).
+    lsr = snap.longShortRatio
+    if isinstance(lsr, float):
+        if lsr > 0.70:
+            return "crowded_long"
+        if lsr < 0.30:
+            return "crowded_short"
     if adx_value > 25:
         return "trending"
     if atr_pct > 0.025:
@@ -132,9 +143,20 @@ class MarketDataService:
         if cached and now < cached[1]:
             return cached[0]
 
-        klines = await self._client.get_kline(category, symbol, "15", 200)
-        ticker = await self._client.get_ticker(category, symbol)
-        orderbook = await self._client.get_orderbook(category, symbol, 50)
+        import asyncio as _asyncio
+        klines, ticker, orderbook, lsr_raw = await _asyncio.gather(
+            self._client.get_kline(category, symbol, "15", 200),
+            self._client.get_ticker(category, symbol),
+            self._client.get_orderbook(category, symbol, 50),
+            self._client.get_long_short_ratio(category, symbol, "1h", 1),
+            return_exceptions=True,
+        )
+        if isinstance(klines, Exception):
+            raise klines
+        if isinstance(ticker, Exception):
+            ticker = None
+        if isinstance(orderbook, Exception):
+            orderbook = {"bids": [], "asks": []}
         try:
             funding = await self._funding_rate_public(symbol)
         except Exception:  # noqa: BLE001
@@ -150,6 +172,10 @@ class MarketDataService:
         ask_depth = sum(_f(a["size"]) for a in orderbook["asks"])
         imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-9)
 
+        lsr: float | None = None
+        if isinstance(lsr_raw, list) and lsr_raw:
+            lsr = _f(lsr_raw[0].get("buyRatio")) or None
+
         t = ticker or {}
         snap = MarketSnapshot(
             symbol=symbol,
@@ -161,6 +187,7 @@ class MarketDataService:
             indicators=indicators,
             orderbook={"bidDepth": bid_depth, "askDepth": ask_depth, "imbalance": imbalance},
             openInterest=(_f(t.get("openInterest")) or None),
+            longShortRatio=lsr,
             research=research,
         )
         self._snapshot_cache[symbol] = (snap, now + 30_000)

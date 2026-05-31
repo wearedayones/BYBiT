@@ -4,6 +4,10 @@ Entries are not usually time-critical, so we first rest a PostOnly limit
 just inside the touch to pay the maker fee (0.020%) instead of the taker
 fee (0.055%). If it does not fill within MAKER_WAIT_MS we cancel and cross
 the spread with a market order.
+
+For large notionals (qty × refPrice > algo_threshold_usdt) in live mode,
+orders are routed through Bybit's native TWAP strategy to reduce market
+impact. Paper/sim mode always uses the regular maker→taker path.
 """
 from __future__ import annotations
 
@@ -16,7 +20,10 @@ from bybit_agent.core.logger import get_logger
 
 log = get_logger().bind(module="execution")
 
-FillType = Literal["maker", "taker"]
+FillType = Literal["maker", "taker", "algo"]
+
+# Default notional threshold for TWAP routing. Overridable via algoThresholdUsdt param.
+TWAP_NOTIONAL_THRESHOLD = 500.0
 
 
 @dataclass
@@ -45,11 +52,17 @@ class OrderClient(Protocol):
     async def get_open_orders(self, category: str, symbol: str | None = None) -> list[Any]: ...
 
 
+class AlgoClient(Protocol):
+    async def create_algo_order(self, params: dict[str, Any]) -> dict[str, Any]: ...
+
+
 class ExecutionRouter:
     """
     isSim: In simulation the PostOnly limit is assumed to fill as maker
            immediately; the live path waits and falls back to market.
     waitMs: Override the maker wait window (tests / sim use 0).
+    algoClient: Optional client with create_algo_order(); enables TWAP routing.
+    algoThresholdUsdt: Notional above which TWAP routing fires (live only).
     """
 
     def __init__(
@@ -57,12 +70,24 @@ class ExecutionRouter:
         client: OrderClient,
         is_sim: bool,
         wait_ms: int = EXECUTION_DEFAULTS["MAKER_WAIT_MS"],
+        algo_client: AlgoClient | None = None,
+        algo_threshold_usdt: float = TWAP_NOTIONAL_THRESHOLD,
     ) -> None:
         self._client = client
         self._is_sim = is_sim
         self._wait_ms = wait_ms
+        self._algo_client = algo_client
+        self._algo_threshold_usdt = algo_threshold_usdt
 
     async def enter(self, p: EnterParams) -> EnterResult:
+        notional = p.qty * p.refPrice
+        if (
+            not self._is_sim
+            and self._algo_client is not None
+            and notional > self._algo_threshold_usdt
+        ):
+            return await self._enter_twap(p)
+
         limit_price = self._maker_limit_price(p.side, p.refPrice)
         base: dict[str, Any] = {
             "category": p.category,
@@ -130,6 +155,28 @@ class ExecutionRouter:
             orderId=taker_order["orderId"],
             orderLinkId=taker_order.get("orderLinkId", f"{p.orderLinkId}-t"),
             fillType="taker",
+            limitPrice=p.refPrice,
+        )
+
+    async def _enter_twap(self, p: EnterParams) -> EnterResult:
+        from .algo_execution import create_twap
+        result = await create_twap(
+            self._algo_client,  # type: ignore[arg-type]
+            category=p.category,
+            symbol=p.symbol,
+            side=p.side,
+            qty=p.qty,
+            duration_secs=300,
+            price_limit=None,
+            reduce_only=False,
+        )
+        algo_id = result.get("algoOrderId", "")
+        log.info("Routed to TWAP algo order", symbol=p.symbol, qty=p.qty,
+                 notional=p.qty * p.refPrice, algo_id=algo_id)
+        return EnterResult(
+            orderId=algo_id,
+            orderLinkId=p.orderLinkId,
+            fillType="algo",
             limitPrice=p.refPrice,
         )
 

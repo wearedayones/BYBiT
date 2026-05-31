@@ -1,7 +1,7 @@
 # BYBiT Skill — Machine-Readable Manifest
 
 **Skill ID:** `bybit-trading`
-**Version:** 2.0.0
+**Version:** 2.1.0
 **Language:** Python 3.11+
 **CLI entrypoint:** `bybit` (console script → `bybit_agent.cli:app`)
 **Architecture:** Deterministic 24/7 service + durable AI event queue + universal CLI
@@ -216,3 +216,50 @@ bybit weights --set/--toggle  ← rebalance if data supports it
 
 Escalate via `bybit pause` or `bybit kill` on critical risk signals.
 The agent **never** pushes code, calls external APIs, or places orders directly.
+
+---
+
+## Official Bybit API Reference (embedded)
+
+The full official Bybit Exchange AI skill is embedded in `skills/`. These markdown
+modules are the authoritative API reference for all Bybit v5 endpoints. Any AI agent
+can read them to look up exact request/response shapes before making manual API calls.
+
+| Module | Topic |
+|---|---|
+| `market` | Klines, tickers, open interest, L/S ratio, historical volatility |
+| `derivatives` | Perpetual futures orders, positions, order history, executions |
+| `spot` | Spot orders, margin trading |
+| `account` | Balances, transfers, sub-accounts, unified account management |
+| `trading-bot` | Spot/futures grid bots, DCA bot, martingale |
+| `strategy` | TWAP, Iceberg, Chase, POV algorithmic execution orders |
+| `copy-trading` | Leader discovery, follower binding, copy settings |
+| `earn` | Savings, staking, liquidity mining, flexible products |
+| `advanced` | WebSocket streams, institutional loans, RFQ block trades |
+| `alpha-trade` | DEX token swaps and on-chain token access |
+| `fiat` | P2P trading, fiat conversion, bank transfers |
+| `tradfi` | Tokenised equities, commodities, MT5 copy trading |
+
+```
+bybit skill list                   ← list all embedded modules
+bybit skill show derivatives       ← print derivatives API reference
+bybit skill show strategy          ← print algo order (TWAP/Iceberg) spec
+bybit skill version                ← show embedded version
+bybit skill refresh                ← pull latest from bybit-exchange/skills on GitHub
+```
+
+The autonomous service implements the full `market`, `derivatives`, `spot`, `account`,
+`trading-bot`, `strategy`, and `copy-trading` modules in Python. The remaining modules
+(`earn`, `advanced`, `alpha-trade`, `fiat`, `tradfi`) are embedded as reference only —
+use `bybit skill show <module>` to read endpoint specs for manual/interactive calls.
+
+### Additional CLI Commands (v2.1.0)
+
+| Command | Description |
+|---|---|
+| `bybit executions [--symbol S] [--limit N] [--json]` | Recent trade fills from `/v5/execution/list` |
+| `bybit algo list [--symbol S] [--json]` | Active TWAP/Iceberg/Chase/POV orders |
+| `bybit skill list [--json]` | List embedded official skill modules |
+| `bybit skill show <module> [--json]` | Print a module's full API reference |
+| `bybit skill refresh [--json]` | Update modules from `bybit-exchange/skills` on GitHub |
+| `bybit skill version [--json]` | Show embedded version |
